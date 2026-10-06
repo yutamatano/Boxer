@@ -142,6 +142,72 @@ class TestTrackerNoDetections:
 
 
 class TestTrackerAging:
+    def test_reappearing_track_keeps_id(self):
+        tracker = BoundingBox3DTracker(
+            verbose=False, conf_threshold=0.0, min_hits=2,
+            merge_iou_threshold=0.0, force_cpu=True,
+        )
+        det = torch.stack([_make_det([0.0, 0.0, 0.5])])
+        tracker.update(det, 0)
+        tracker.update(det, 1)
+        track = tracker.tracks[0]
+        track_id = track.track_id
+        track.state = TrackState.INACTIVE
+        track.last_visible = False
+        track.missed_count = 1
+
+        tracker.update(det, 2)
+
+        assert len(tracker.tracks) == 1
+        assert tracker.tracks[0].track_id == track_id
+        assert track.state == TrackState.ACTIVE
+        assert track.missed_count == 0
+        assert track.support_count == 3
+
+    def test_point_support_preserves_aging(self):
+        tracker = BoundingBox3DTracker(
+            verbose=False, conf_threshold=0.0, min_hits=2,
+            merge_iou_threshold=0.0, min_obs_points=2,
+        )
+        det = torch.stack([_make_det([0.0, 0.0, 0.5])])
+        tracker.update(det, 0)
+        tracker.update(det, 1)
+        empty = det[:0]
+        outside = torch.tensor([[10.0, 10.0, 10.0]])
+        tracker.update(empty, 2, observed_points=outside)
+        assert tracker.tracks[0].missed_count == 0
+        assert not tracker.tracks[0].last_visible
+        inside = torch.tensor([[0.0, 0.0, 0.5], [0.1, 0.1, 0.5]])
+        tracker.update(empty, 3, observed_points=inside)
+        assert tracker.tracks[0].missed_count == 1
+        assert tracker.tracks[0].last_visible
+
+    def test_projection_visibility_controls_point_aging(self, monkeypatch):
+        from utils.tw.obb import ObbTW
+
+        tracker = BoundingBox3DTracker(
+            verbose=False, conf_threshold=0.0, min_hits=2,
+            merge_iou_threshold=0.0, min_obs_points=2,
+        )
+        dets = torch.stack([
+            _make_det([0.0, 0.0, 0.5]),
+            _make_det([10.0, 0.0, 0.5]),
+        ])
+        tracker.update(dets, 0)
+        tracker.update(dets, 1)
+        monkeypatch.setattr(
+            ObbTW, "get_pseudo_bb2",
+            lambda *args, **kwargs: (None, torch.tensor([[True, False]])),
+        )
+        points = torch.tensor([
+            [0.0, 0.0, 0.5], [0.1, 0.1, 0.5],
+            [10.0, 0.0, 0.5], [10.1, 0.1, 0.5],
+        ])
+        # Tensor placeholders provide unsqueeze; projection is stubbed above.
+        tracker.update(dets[:0], 2, torch.zeros(1), torch.zeros(1), points)
+        assert [t.missed_count for t in tracker.tracks] == [1, 0]
+        assert [t.last_visible for t in tracker.tracks] == [True, False]
+
     def test_tracks_removed_after_max_missed(self):
         tracker = BoundingBox3DTracker(verbose=False, conf_threshold=0.0, max_missed=2)
         det = _make_det([0.0, 0.0, 0.5])

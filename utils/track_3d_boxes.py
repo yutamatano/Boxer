@@ -10,19 +10,18 @@
 Online 3D Bounding Box Tracker
 
 Maintains a set of tracked instances and matches them against each frame's
-detections using a VxN IoU matrix (V visible tracks x N detections), where
-V << total tracks M. Invisible tracks (behind walls, out of FOV) are skipped
-in the IoU computation and sent directly to aging. Uses Hungarian assignment
-for optimal matching.
+detections using an MxN IoU matrix (M retained tracks x N detections).
+Spatially disjoint boxes are eliminated inside the IoU computation. Uses
+Hungarian assignment for optimal matching; visibility controls aging only.
 
 Algorithm per frame:
 1. Filter detections by confidence threshold
-2. Partition tracks into visible and invisible using cached last_visible flag
-3. Compute VxN IoU between visible tracks and new detections
+2. Include retained tracks, allowing objects to reappear after occlusion
+3. Compute MxN IoU between tracks and new detections
 4. Hungarian assignment with IoU threshold gating
 5. Update matched tracks (confidence-weighted averaging)
 6. Create new tracks from unmatched detections
-7. Age and remove stale tracks (unmatched visible + all invisible)
+7. Age unmatched tracks using current-frame visibility and remove stale tracks
 """
 
 import time
@@ -219,34 +218,33 @@ class BoundingBox3DTracker:
 
         # Case 3: Both tracks and detections exist -> match
 
-        # Partition tracks into visible and invisible using cached flag.
-        # Invisible tracks (behind walls, out of FOV) cannot match any
-        # detection, so we skip them in the IoU computation entirely.
-        visible_indices = [i for i, t in enumerate(self.tracks) if t.last_visible]
-        invisible_indices = [i for i, t in enumerate(self.tracks) if not t.last_visible]
-        V = len(visible_indices)
+        # A previous-frame visibility flag cannot rule out a current detection:
+        # camera motion or renewed point support can make a track visible again.
+        # IoU already eliminates spatially disjoint boxes before sampling.
+        candidate_indices = list(range(M))
+        V = len(candidate_indices)
 
         t0 = time.perf_counter()
         matched_tracks = set()
         matched_detections = set()
 
         if V > 0:
-            # Stack only visible track OBBs for batch IoU (V×N instead of M×N)
-            visible_obbs = torch.stack([self.tracks[i].obb for i in visible_indices])
+            # Stack retained track OBBs for batch IoU (M×N)
+            candidate_obbs = torch.stack([self.tracks[i].obb for i in candidate_indices])
 
             # Move to CUDA if available for IoU computation (skip MPS — transfer
             # overhead dominates for small matrices and causes scheduling jitter).
             if self.force_cpu or not torch.cuda.is_available():
-                visible_obbs_gpu = visible_obbs
-                detections_gpu = detections
+                candidate_obbs_device = candidate_obbs
+                detections_device = detections
             else:
-                visible_obbs_gpu = visible_obbs.to("cuda")
-                detections_gpu = detections.to("cuda")
+                candidate_obbs_device = candidate_obbs.to("cuda")
+                detections_device = detections.to("cuda")
 
-            # Compute V×N IoU matrix (visible tracks only)
+            # Compute IoU for all retained tracks
             iou_result = iou_mc7(
-                visible_obbs_gpu,
-                detections_gpu,
+                candidate_obbs_device,
+                detections_device,
                 samp_per_dim=self.samp_per_dim,
                 verbose=False,
             )
@@ -269,7 +267,7 @@ class BoundingBox3DTracker:
             # Map Hungarian row indices back to self.tracks indices
             for r, c in zip(row_ind, col_ind):
                 if cost_matrix[r, c] < 1.0:  # Valid match
-                    original_idx = visible_indices[r]
+                    original_idx = candidate_indices[r]
                     self._update_track(
                         self.tracks[original_idx], detections[c], frame_idx
                     )
@@ -290,10 +288,10 @@ class BoundingBox3DTracker:
                 n_created += 1
         t_create = time.perf_counter()
 
-        # Age unmatched tracks: unmatched visible + all invisible
+        # Age unmatched tracks using current camera and point support
         unmatched_indices = [
-            i for i in visible_indices if i not in matched_tracks
-        ] + invisible_indices
+            i for i in candidate_indices if i not in matched_tracks
+        ]
         if unmatched_indices:
             self._age_tracks_batched(
                 unmatched_indices, frame_idx, cam, T_world_rig, observed_points
@@ -326,14 +324,14 @@ class BoundingBox3DTracker:
             n_active = sum(1 for t in self.tracks if t.state == TrackState.ACTIVE)
             n_inactive = sum(1 for t in self.tracks if t.state == TrackState.INACTIVE)
             print(
-                f"  [BENCH] tracker.update ({V}v/{M}x{N}): "
+                f"  [BENCH] tracker.update ({M}x{N}): "
                 f"iou={(t_iou - t0) * 1000:.1f}ms  "
                 f"hungarian={(t_hungarian - t_iou) * 1000:.1f}ms  "
                 f"create({n_created})={(t_create - t_create0) * 1000:.1f}ms  "
                 f"age({len(unmatched_indices)})={(t_age - t_create) * 1000:.1f}ms  "
                 f"merge={(t_merge - t_remove) * 1000:.1f}ms  "
                 f"tracks={len(self.tracks)}(T={n_tent}/A={n_active}/I={n_inactive}) "
-                f"matched={len(matched_tracks)}/{V}vis"
+                f"matched={len(matched_tracks)}/{V} candidates"
             )
 
         return self._get_active_tracks()
@@ -898,10 +896,23 @@ class BoundingBox3DTracker:
         if observed_points is not None and stacked_obbs is not None:
             K = len(stacked_obbs)
             N_pts = observed_points.shape[0]
-            pts_expanded = observed_points.unsqueeze(0).expand(K, N_pts, 3)  # (K, N, 3)
-            inside = stacked_obbs.batch_points_inside_bb3(pts_expanded)  # (K, N) bool
-            points_inside_count = inside.sum(dim=1)  # (K,)
-            has_enough_points = points_inside_count >= self.min_obs_points  # (K,) bool
+            # Point support only affects aging for projection-visible tracks.
+            # Skip out-of-view boxes and bound the temporary K x N x 3 tensor.
+            eligible = (
+                torch.where(is_visible)[0]
+                if is_visible is not None
+                else torch.arange(K, device=stacked_obbs.device)
+            )
+            has_enough_points = torch.zeros(
+                K, dtype=torch.bool, device=stacked_obbs.device
+            )
+            chunk_size = max(1, 262144 // max(N_pts, 1))
+            for start in range(0, len(eligible), chunk_size):
+                indices = eligible[start : start + chunk_size]
+                boxes = stacked_obbs[indices]
+                pts_expanded = observed_points.unsqueeze(0).expand(len(indices), -1, -1)
+                inside = boxes.batch_points_inside_bb3(pts_expanded)
+                has_enough_points[indices] = inside.sum(dim=1) >= self.min_obs_points
         else:
             has_enough_points = None
             N_pts = 0

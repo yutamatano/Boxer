@@ -46,9 +46,9 @@ def main():
     )
 
     # Load OBBs
-    tracked_csv = os.path.join(log_dir, f"{args.write_name}_3dbbs_tracked.csv")
     raw_csv = os.path.join(log_dir, f"{args.write_name}_3dbbs.csv")
-    csv_path = tracked_csv if os.path.exists(tracked_csv) else raw_csv
+    # Online tracking needs per-frame detections, not already-fused track history.
+    csv_path = raw_csv
     if not os.path.exists(csv_path):
         raise IOError(f"3D BB CSV not found: {csv_path}")
 
