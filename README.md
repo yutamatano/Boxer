@@ -150,6 +150,88 @@ python view_prompt.py --input scene0707_00
 
 ![ScanNet Prompt](docs/images/scannet_screenshot.jpg)
 
+## Neon recordings (scene video, with or without point clouds)
+
+Install the optional official native-recording reader in the Boxer environment:
+
+```bash
+uv pip install 'pupil-labs-neon-recording>=2.1.6,<3'
+```
+
+`run_boxer.py` detects folders containing `Neon Scene Camera v1 ps*.mp4`.
+It reads the scene video, `.time` timestamps and `calibration.bin`, and rectifies
+the image to a pinhole camera before inference. Eye videos are not scene input.
+The two sample recordings can be run with the existing checkpoints:
+
+```bash
+python run_boxer.py --input 2026-09-30_15-22-47 --point_cloud off --start_n 0 --max_n 90
+python run_boxer.py --input 2026-09-30_17-54-53 --point_cloud off --start_n 0 --max_n 90
+```
+
+Add `--skip_viz` for CSV-only output or `--force_cpu` for CPU inference.
+`--start_n` is a zero-based source frame index (the existing CLI default is 1);
+`--skip_n` is the source-frame stride and `--max_n` limits the selected frames.
+
+- `--point_cloud auto` (default): use supplied points; Neon without geometry uses no points.
+- `--point_cloud off` (also `--no_sdp`): supply an empty point tensor. All depth
+  patches use the existing missing-depth value `-1`; model weights are unchanged.
+  Aria point/observation files are not loaded in this mode.
+- `--point_cloud on`: require valid points in every processed frame; missing
+  points cause an error rather than a silent fallback.
+
+Without a camera trajectory, the 3D boxes are **independent per-frame estimates**
+in an assumed-upright local frame: X right, Y camera-forward, Z up. The camera
+origin is reset for each frame. This is not a measured world trajectory or gravity
+alignment; metric depth/size and prediction quality without points are unverified.
+`--track` and `--fuse` therefore require external registered camera poses for Neon.
+IMU orientation and gaze are not yet fused into these predictions.
+
+Alongside the existing box CSVs, Neon writes `boxer_input.json` (coordinate/input
+semantics, original intrinsics and distortion) and `boxer_frames.csv` (selected
+source frame IDs, `.time` and `.time_aux` values). The prefix follows `--write_name`.
+The frame table includes frames with zero detections; box CSVs contain detections
+only. `.time` is the primary clock, matching the official reader; `.time_aux` is
+preserved separately (`-1` if absent). Timestamps remain integer nanoseconds.
+To overlay raw gaze later, apply the same undistortion and resize to its pixel
+coordinates. The generated JPEG/MP4 visualization supports Neon; the separate
+interactive `view_*.py` loaders do not yet support Neon recordings.
+
+### External point clouds and camera poses
+
+Use `--neon_geometry /path/to/registered_geometry.npz` to provide geometry derived
+from a phone or reconstruction. The NPZ must contain:
+
+| Key | Shape / dtype | Meaning |
+| --- | --- | --- |
+| `timestamps_ns` | `(F,)`, `int64`, strictly increasing | Exact scene `.time` values; must cover every selected frame |
+| `T_world_camera` | `(F, 4, 4)`, float | Rigid scene-camera-to-world transforms; right-handed Z-up world, translations in metres |
+| `points_world` (optional) | `(N, 3)` or `(F, N, 3)`, float | Static world map or per-frame observed points, in the same world frame and metres; all-NaN rows may pad variable counts |
+
+Camera coordinates follow OpenCV: X right, Y down, Z forward. Register both phone
+geometry and **Neon scene-camera poses** to the same world before exporting;
+a phone pose cannot be used as the Neon pose without this alignment. Synchronize
+the device clocks and interpolate poses to the exact scene timestamps upstream.
+The loader deliberately does not guess a clock offset, metric scale or extrinsics.
+
+```python
+# These arrays must come from your calibrated, time-aligned reconstruction.
+np.savez("registered_geometry.npz", timestamps_ns=scene_times_ns,
+         T_world_camera=neon_camera_to_world, points_world=registered_points)
+```
+
+```bash
+# Use points and poses for 3D inference / tracking.
+python run_boxer.py --input 2026-09-30_15-22-47 --neon_geometry registered_geometry.npz --point_cloud on --track
+# Use the same poses, but remove depth input for a controlled comparison.
+python run_boxer.py --input 2026-09-30_15-22-47 --neon_geometry registered_geometry.npz --point_cloud off --write_name boxer_no_points
+```
+
+Pose-only NPZ files also work with `auto` or `off`. Static map points inform
+BoxerNet depth input but are not passed as evidence of current visibility to the
+tracker. Only per-frame observed points provide that evidence; without them the
+tracker uses its existing projection-only aging fallback. No-point operation
+thus loses both measured depth input and point-based visibility evidence.
+
 ## run_boxer.py Usage Details
 
 The pipeline supports optional **online 3D tracking** (`--track`) for temporal consistency and **offline 3D fusion** (`--fuse`) for merging detections across frames after all detections have been made.
@@ -213,7 +295,9 @@ Results are written to `output/<sequence_name>/`:
 | `--ckpt` | see code | Path to BoxerNet checkpoint |
 | `--output_dir` | `output/` | Output directory |
 | `--gt2d` | off | Use ground-truth 2D boxes as input |
-| `--no_sdp` | off | Disable semi-dense point input |
+| `--point_cloud` | `auto` | Point input mode: `auto`, `on` (required), `off` |
+| `--no_sdp` | off | Alias for `--point_cloud off` |
+| `--neon_geometry` | none | Registered external Neon pose/point NPZ (schema above) |
 | `--force_cpu` | off | Force CPU inference |
 
 ## Project Structure

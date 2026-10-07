@@ -17,6 +17,7 @@ from tqdm import tqdm
 
 from boxernet.boxernet import BoxerNet
 from loaders.ca_loader import CALoader
+from loaders.neon_loader import NeonLoader
 from loaders.omni_loader import OMNI3D_DATASETS, OmniLoader
 from loaders.scannet_loader import ScanNetLoader
 from utils.demo_utils import (
@@ -105,7 +106,10 @@ def main():
     parser.add_argument("--skip_viz", action="store_true", help="disable headless visualization (on by default)")
     parser.add_argument("--cache2d", action="store_true", help="load 2D BBs from CSV instead of running detector")
     parser.add_argument("--cache3d", action="store_true", help="load 3D BBs from CSV instead of running BoxerNet")
-    parser.add_argument("--no_sdp", action="store_true", help="turn off SDP input")
+    points = parser.add_mutually_exclusive_group()
+    points.add_argument("--point_cloud", choices=["auto", "on", "off"], default="auto", help="point input: auto uses available points, on requires them, off uses missing-depth inputs")
+    points.add_argument("--no_sdp", dest="point_cloud", action="store_const", const="off", help="alias for --point_cloud off")
+    parser.add_argument("--neon_geometry", type=str, help="Neon NPZ: timestamps_ns, T_world_camera, optional points_world (see README)")
     parser.add_argument("--no_csv", action="store_true", help="skip CSV writing")
     parser.add_argument("--force_cpu", action="store_true", help="force CPU")
     parser.add_argument("--gt2d", action="store_true", help="use GT pseudo 2DBB as input")
@@ -151,7 +155,7 @@ def main():
         seq_name = args.input
     else:
         dataset_type = "aria"
-        remote_root = args.input
+        remote_root = os.path.expanduser(args.input)
         # Resolve bare sequence names: try sample_data/ first, then ~/boxy_data/
         if not os.path.isabs(remote_root) and not os.path.exists(remote_root):
             sample = os.path.join(SAMPLE_DATA_PATH, remote_root)
@@ -161,6 +165,33 @@ def main():
             elif os.path.exists(legacy):
                 remote_root = legacy
         seq_name = remote_root.rstrip("/").split("/")[-1]
+        if NeonLoader.is_recording(remote_root):
+            dataset_type = "neon"
+
+    if args.neon_geometry and dataset_type != "neon":
+        parser.error("--neon_geometry is only supported for Neon recordings")
+    if dataset_type == "neon":
+        if args.camera != "rgb" or args.gt2d:
+            parser.error("Neon uses the scene camera and has no --gt2d annotations")
+        if (args.track or args.fuse) and not args.neon_geometry:
+            parser.error(
+                "Neon --track/--fuse requires --neon_geometry with registered "
+                "T_world_camera poses. Without a trajectory, use per-frame detection."
+            )
+        if args.cache3d and args.fuse:
+            # Validate the actual output's frame, not just a newly supplied path.
+            import json
+
+            metadata_path = os.path.join(
+                os.path.expanduser(args.output_dir), seq_name,
+                f"{args.write_name}_input.json",
+            )
+            if not os.path.exists(metadata_path):
+                parser.error("Cached Neon fusion requires input coordinate metadata")
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+            if metadata.get("coordinate_frame") != "world_z_up":
+                parser.error("Cannot fuse cached per-frame Neon boxes; rerun with poses")
 
     # get name of containing directory
     output_dir = os.path.expanduser(args.output_dir)
@@ -195,7 +226,16 @@ def main():
         return
 
     # Create data loader
-    if dataset_type == "scannet":
+    if dataset_type == "neon":
+        try:
+            loader = NeonLoader(
+                remote_root, start_n=args.start_n, skip_n=args.skip_n,
+                max_n=args.max_n, point_cloud=args.point_cloud,
+                geometry_path=args.neon_geometry,
+            )
+        except (ValueError, ImportError, OSError) as exc:
+            parser.error(str(exc))
+    elif dataset_type == "scannet":
         loader = ScanNetLoader(
             scene_dir=args.input,
             annotation_path=os.path.join(
@@ -241,7 +281,7 @@ def main():
             remote_root,
             camera=args.camera,
             with_traj=True,
-            with_sdp=True,
+            with_sdp=args.point_cloud != "off",
             with_obb=args.gt2d,
             pinhole=args.pinhole,
             resize=None,
@@ -301,6 +341,8 @@ def main():
     # Re-trigger prefetch so the first frame uses the correct resize.
     loader._init_prefetch()
     print(f"==> Will resize images to {loader.resize}x{loader.resize} for boxernet")
+    if dataset_type == "neon" and not args.no_csv:
+        loader.write_metadata(log_dir, args.write_name)
     _dbg("boxernet")
 
     # Print model architecture
@@ -410,11 +452,15 @@ def main():
                 flush=True,
             )
 
-        sdp_w_viz = datum["sdp_w"].float()  # Keep original SDP for visualization
-        if args.no_sdp:
-            # TURN OFF SDP inputs by removing them
-            print("==> Removing SDP inputs")
-            datum["sdp_w"] = torch.zeros(0, 3)
+        if args.point_cloud == "off":
+            datum["sdp_w"] = torch.empty(0, 3)
+        else:
+            datum.setdefault("sdp_w", torch.empty(0, 3))
+        if args.point_cloud == "on":
+            if not torch.isfinite(datum["sdp_w"]).all(dim=-1).any():
+                raise ValueError(
+                    f"Point cloud required but missing at time {datum['time_ns0']}"
+                )
 
         # 2D Detection
         timer.start("owl")
@@ -556,7 +602,7 @@ def main():
             bb2d_xyxy = bb2d[:, [0, 2, 1, 3]]
             save_bb2d_csv(
                 csv2d_out_path,
-                frame_id=ii,
+                frame_id=datum.get("frame_id", ii),
                 bb2d=bb2d_xyxy,
                 scores=scores2d,
                 labels=labels2d,
@@ -575,8 +621,12 @@ def main():
         active_tracks = None
         if tracker is not None:
             timer.start("track")
+            observed_points = datum.get("observed_points", sdp_w)
+            if args.point_cloud == "off" or sdp_w.numel() == 0:
+                observed_points = None
             active_tracks = tracker.update(
-                obb_pr_w, ii, cam=cam, T_world_rig=T_wr, observed_points=sdp_w
+                obb_pr_w, ii, cam=cam, T_world_rig=T_wr,
+                observed_points=observed_points,
             )
             t_track = timer.stop("track")
 
@@ -761,6 +811,8 @@ def main():
             timing_str += f" viz:{t_viz:.0f}ms"
         pbar.set_postfix_str(f"{len(bb2d)} 2D, {obb_pr_w.shape[0]} 3D | " + timing_str)
 
+    if dataset_type == "neon":
+        loader.close()
     if writer is not None:
         writer.close()
         print(f"==> Saved 3D BBs to {csv_path}")
