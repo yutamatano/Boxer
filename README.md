@@ -184,7 +184,7 @@ in an assumed-upright local frame: X right, Y camera-forward, Z up. The camera
 origin is reset for each frame. This is not a measured world trajectory or gravity
 alignment; metric depth/size and prediction quality without points are unverified.
 `--track` and `--fuse` therefore require external registered camera poses for Neon.
-IMU orientation and gaze are not yet fused into these predictions.
+In this frame-only mode, IMU orientation and gaze are not fused into predictions.
 
 Alongside the existing box CSVs, Neon writes `boxer_input.json` (coordinate/input
 semantics, original intrinsics and distortion) and `boxer_frames.csv` (selected
@@ -231,6 +231,139 @@ BoxerNet depth input but are not passed as evidence of current visibility to the
 tracker. Only per-frame observed points provide that evidence; without them the
 tracker uses its existing projection-only aging fallback. No-point operation
 thus loses both measured depth input and point-based visibility evidence.
+
+### Estimate Neon camera poses from scene video and IMU
+
+The optional offline adapter uses **monocular-inertial ORB-SLAM3**. It does not
+change BoxerNet, the tracker, or fusion. Its outputs are continuous pose-only
+segments that the existing `--neon_geometry` option accepts. This does not add
+Neon support to the interactive `view_tracker.py` loader.
+
+Install `scipy` in the Boxer Python environment for the rotation/synchronization
+and trajectory-conversion utilities (`uv pip install scipy`).
+
+On Linux, first provide CMake, a C++17 compiler, OpenCV >= 4.4, Eigen3, Boost
+serialization, OpenSSL, GLEW, OpenGL and X11 development packages. For example,
+the Ubuntu packages are `cmake libopencv-dev libeigen3-dev
+libboost-serialization-dev libssl-dev libglew-dev libgl1-mesa-dev libx11-dev`.
+The build helper also accepts dependencies installed under a local prefix;
+no dependencies or recordings are committed to this repository.
+The helper uses one compiler process and `-O1` for the ORB core to limit initial
+build memory. It prefers Clang when available, otherwise GCC; `CXX` selects the
+compiler explicitly. `NEON_BUILD_JOBS` overrides the job count. If changing
+compilers, use a fresh `NEON_VIO_BUILD_DIR` to preserve the previous build.
+The core, g2o and adapter use the same 16-byte Eigen alignment ABI. The build
+patch removes g2o's private `-march=native`, because mixed AVX/SSE builds also
+disagree on Eigen allocation/free policy; matching object alignment alone
+does not prevent crashes. See the
+[Eigen alignment documentation](https://libeigen.gitlab.io/eigen/docs-nightly/TopicPreprocessorDirectives.html).
+
+```bash
+mkdir -p output/neon_vio_deps
+git clone https://github.com/UZ-SLAMLab/ORB_SLAM3.git output/neon_vio_deps/ORB_SLAM3
+git -C output/neon_vio_deps/ORB_SLAM3 checkout 4452a3c4ab75b1cde34e5505a36ec3f9edcdc4c4
+git clone --branch v0.8 https://github.com/stevenlovegrove/Pangolin.git output/neon_vio_deps/Pangolin
+git -C output/neon_vio_deps/Pangolin checkout aff6883c83f3fd7e8268a9715e84266c42e2efe3
+bash scripts/build_neon_vio.sh
+```
+
+`build_neon_vio.sh [ORB_CHECKOUT] [PANGOLIN_CHECKOUT] [INSTALL_PREFIX]` checks
+the pinned revisions and applies `slam/export_neon.patch` and
+`slam/build_compat.patch` (GCC-specific integer includes use the standard header;
+legacy `bool++` uses assignment to `true`, preserving its C++11 behavior while
+allowing C++17). The small export
+patch saves final **scene-camera** poses after mapping/loop-closure threads
+finish. It retains the gravity-aligned SLAM world; the standard inertial EuRoC
+export instead saves body poses in a rotated body-origin frame. Tracking and
+optimization algorithms are unchanged. Duplicate fallback history entries for
+empty poses are omitted rather than reused as missing-frame poses. ORB-SLAM3 and the linked adapter
+executable use the upstream GPLv3 license.
+
+Prepare a short interval before attempting the entire recording:
+
+```bash
+python prepare_neon_vio.py --input 2026-09-30_15-22-47 \
+  --start_n 0 --max_n 1200 --width 800 --experimental-noise --check-sync
+
+# Needed when C++ dependencies were installed in the default local prefix.
+export LD_LIBRARY_PATH="$PWD/output/neon_vio_deps/prefix/usr/lib/x86_64-linux-gnu:$PWD/output/neon_vio_deps/prefix/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+output/neon_vio_build/mono_inertial_neon \
+  output/neon_vio_deps/ORB_SLAM3/Vocabulary/ORBvoc.txt \
+  output/neon_vio/2026-09-30_15-22-47/prepared \
+  output/neon_vio/2026-09-30_15-22-47/slam
+
+python convert_neon_trajectory.py \
+  --prepared output/neon_vio/2026-09-30_15-22-47/prepared \
+  --trajectory output/neon_vio/2026-09-30_15-22-47/slam/camera_trajectory.csv \
+  --states output/neon_vio/2026-09-30_15-22-47/slam/states.csv \
+  --output output/neon_vio/2026-09-30_15-22-47/geometry
+```
+
+The preparation preserves source frame IDs and original integer `.time`
+timestamps. SLAM uses seconds relative to an integer epoch, rectified images
+with matching intrinsics, gyro in rad/s and acceleration in m/s² **including
+gravity**. It excludes images outside IMU coverage and records all choices in
+`manifest.json`. Default extrinsics are the manufacturer's nominal camera-to-IMU
+transform; supply `--extrinsics` with a calibrated 4x4 JSON matrix in metres to
+replace it. `--time-source aux` changes only SLAM's image clock, while
+`--imu-offset-ms` adds a documented offset to the IMU clock. Exported Boxer
+timestamps always remain the original `.time` labels. `--check-sync` diagnoses
+visual/gyro rotation consistency; it never applies a candidate offset automatically.
+
+IMU noise density/random walk calibration is absent from the recordings.
+`--experimental-noise` explicitly permits an **uncalibrated pilot baseline**.
+For calibrated runs, replace it with `--imu-noise noise.json` containing positive
+`NoiseGyro`, `NoiseAcc`, `GyroWalk`, `AccWalk` values in ORB-SLAM3's SI conventions
+and an optional `source` description. A successful metric initialization is
+necessary, but does not establish trajectory accuracy or correct synchronization.
+
+The runner writes per-frame state/mapped-feature/initialization/map/timing information
+to `states.csv`. Its default scheduling follows recorded time to give the
+background mapper time to work; an optional final numeric argument changes
+this pace (`1` default, `0` fastest). Exit code 3 means runtime/final metric
+trajectory checks failed, including initialization later lost to resets.
+The converter keeps only frames with successful
+tracking and runtime/final IMU initialization. Lost frames, source gaps and
+map resets split segments; it never invents or interpolates missing poses.
+`report.json` includes coverage, segment ranges, speed/rotation-step statistics
+and calibration limitations. Empty/nonmetric results cause an error.
+
+Use a segment's **printed `--start_n` and `--max_n`** to select its exact frame
+range (replace the placeholders below):
+
+```bash
+python run_boxer.py --input 2026-09-30_15-22-47 \
+  --neon_geometry output/neon_vio/2026-09-30_15-22-47/geometry/geometry_segment_000.npz \
+  --start_n <start_n> --max_n <max_n> --point_cloud off \
+  --track --skip_viz --write_name boxer_vio_track
+# Replace --track with --fuse and use a different --write_name for fusion.
+```
+
+Each segment retains a right-handed Z-up world in metres and translates its
+first camera position to the origin. Different segments have independent
+origins and must not be fused together without registration. No point cloud
+is fabricated: phone depth can later supply registered `points_world`.
+Absolute trajectory error cannot be measured without an external reference;
+monocular box depth/size remains unvalidated when points are disabled.
+
+The supplied recordings were checked with the experimental noise baseline and
+nominal extrinsics. In the first recording's initial 120-second pilot, 1,197
+frames were processed: 72 had runtime metric tracking, but 13 IMU
+deinitializations/map resets left **zero final metric poses**. The converter
+correctly rejected this run. In the second recording's first 30 selected
+frames, the 28 IMU-covered images were dark and metric initialization failed.
+These results establish input/runner/error handling, **not successful Neon
+world tracking or trajectory accuracy**. Bright images with translational
+excitation, IMU calibration and independently checked clock alignment still
+need evaluation. Timing candidates are diagnostics and have not been adopted
+as calibrated offsets.
+
+Tracking/fusion regression used 634 saved real Aria detections over 30 frames,
+with points disabled. The tracked CSV preserves 24 source timestamps, 387
+history rows and 23 IDs, with the same final tracker state as before the
+history-saving change. Fusion produced 37 finite static OBBs. This regression
+is separate from Neon trajectory estimation. Per-frame detections remain
+usable when no valid trajectory exists.
 
 ## run_boxer.py Usage Details
 

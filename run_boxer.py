@@ -414,6 +414,7 @@ def main():
             f.write(jpg_bytes)
 
     timestamps_ns = []  # Collect timestamps to compute FPS
+    tracked_history = []
     timer = CudaTimer(device)
     pbar = tqdm(range(len(loader)), desc="BoxerNet")
     DEBUG_VIZ = os.environ.get("DEBUG_VIZ", "0") == "1"
@@ -628,6 +629,15 @@ def main():
                 obb_pr_w, ii, cam=cam, T_world_rig=T_wr,
                 observed_points=observed_points,
             )
+            if active_tracks:
+                tracked_obbs = torch.stack([t.obb.clone() for t in active_tracks])
+                track_ids = torch.tensor(
+                    [t.track_id for t in active_tracks],
+                    dtype=torch.int32,
+                    device=tracked_obbs.device,
+                )
+                tracked_obbs.set_inst_id(track_ids)
+                tracked_history.append((time_ns, tracked_obbs.clone()))
             t_track = timer.stop("track")
 
         if args.viz_headless:
@@ -846,30 +856,37 @@ def main():
         print(f"\n==> Running fusion on {csv_path}")
         fuse_obbs_from_csv(csv_path)
 
-    if tracker is not None:
-        active_tracks = tracker._get_active_tracks()
-        print(f"==> {len(active_tracks)} active tracks from inline tracker")
+    if tracker is not None and tracked_history:
+        base, ext = os.path.splitext(csv_path)
+        track_output_path = f"{base}_tracked{ext}"
+        track_writer = ObbCsvWriter2(track_output_path)
 
-        if len(active_tracks) > 0:
-            base, ext = os.path.splitext(csv_path)
-            track_output_path = f"{base}_tracked{ext}"
-
-            tracked_obbs = torch.stack([t.obb for t in active_tracks])
-            ids = torch.tensor([t.track_id for t in active_tracks], dtype=torch.int32)
-            tracked_obbs.set_inst_id(ids)
+        for time_ns, tracked_obbs in tracked_history:
+            tracked_obbs = tracked_obbs.clone()
 
             rounded_prob = torch.round(tracked_obbs.prob * 100) / 100
-            tracked_obbs.set_prob(rounded_prob.squeeze(-1), use_mask=False)
+            tracked_obbs.set_prob(
+                rounded_prob.squeeze(-1),
+                use_mask=False,
+            )
 
             track_sem = {}
             for obb in tracked_obbs:
                 sid = int(obb.sem_id.item())
                 if sid not in track_sem:
                     track_sem[sid] = unpad_string(tensor2string(obb.text.int()))
-            track_writer = ObbCsvWriter2(track_output_path)
-            track_writer.write(tracked_obbs, timestamps_ns=0, sem_id_to_name=track_sem)
-            track_writer.close()
-            print(f"==> Saved {len(active_tracks)} tracked OBBs to {track_output_path}")
+
+            track_writer.write(
+                tracked_obbs,
+                timestamps_ns=time_ns,
+                sem_id_to_name=track_sem,
+            )
+
+        track_writer.close()
+        print(
+            f"==> Saved tracked OBB history for "
+            f"{len(tracked_history)} frames to {track_output_path}"
+        )
 
 
 if __name__ == "__main__":

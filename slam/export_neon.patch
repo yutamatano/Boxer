@@ -1,0 +1,89 @@
+diff --git a/include/System.h b/include/System.h
+index 872c86e..67c0558 100644
+--- a/include/System.h
++++ b/include/System.h
+@@ -172,8 +172,12 @@ public:
+     // LoadMap(const string &filename);
+
+     // Information from most recent processed frame
+     // You can call this right after TrackMonocular (or stereo or RGBD)
++    // Neon adapter: current map state and final gravity-aligned CAMERA poses.
++    std::pair<long, bool> GetNeonMapState();
++    size_t SaveNeonCameraTrajectory(const string &filename);
++
+     int GetTrackingState();
+     std::vector<MapPoint*> GetTrackedMapPoints();
+     std::vector<cv::KeyPoint> GetTrackedKeyPointsUn();
+
+diff --git a/src/System.cc b/src/System.cc
+index 60d9c51..4d4cadd 100644
+--- a/src/System.cc
++++ b/src/System.cc
+@@ -658,8 +658,67 @@ void System::SaveKeyFrameTrajectoryTUM(const string &filename)
+
+     f.close();
+ }
+
++std::pair<long, bool> System::GetNeonMapState()
++{
++    Map* map = mpAtlas->GetCurrentMap();
++    return map ? std::make_pair(static_cast<long>(map->GetId()), map->isImuInitialized())
++               : std::make_pair(-1L, false);
++}
++
++size_t System::SaveNeonCameraTrajectory(const string &filename)
++{
++    if (!isShutDown())
++        throw std::runtime_error("Call Shutdown before exporting Neon poses");
++    // Upstream Shutdown currently only requests finish. Wait before reading
++    // optimized keyframes, including a pending global bundle adjustment.
++    while (!mpLocalMapper->isFinished() || !mpLoopCloser->isFinished()
++           || mpLoopCloser->isRunningGBA())
++        usleep(5000);
++    if (mptLocalMapping->joinable()) mptLocalMapping->join();
++    if (mptLoopClosing->joinable()) mptLoopClosing->join();
++    ofstream out(filename);
++    if (!out) throw std::runtime_error("Cannot write Neon camera trajectory");
++    out << "slam_time_s,map_id,metric,tx,ty,tz,qx,qy,qz,qw\n" << setprecision(17);
++    auto reference = mpTracker->mlpReferences.begin();
++    auto time = mpTracker->mlFrameTimes.begin();
++    auto lost = mpTracker->mlbLost.begin();
++    size_t metricFrames = 0;
++    std::set<double> exportedTimes;
++    for (auto pose = mpTracker->mlRelativeFramePoses.begin();
++         pose != mpTracker->mlRelativeFramePoses.end();
++         ++pose, ++reference, ++time, ++lost)
++    {
++        if (*lost || !*reference) continue;
++        // Empty-pose fallback history repeats the previous frame timestamp.
++        // Omit that duplicate; never assign the previous pose to a lost frame.
++        if (!exportedTimes.insert(*time).second) continue;
++        KeyFrame* keyframe = *reference;
++        Sophus::SE3f parentChain;
++        size_t parents = 0;
++        while (keyframe && keyframe->isBad() && parents++ < 10000)
++        {
++            parentChain = parentChain * keyframe->mTcp;
++            keyframe = keyframe->GetParent();
++        }
++        if (!keyframe || keyframe->isBad() || !keyframe->GetMap()) continue;
++        Map* map = keyframe->GetMap();
++        // Keep the initialized SLAM world (gravity points toward -Z). EuRoC's
++        // body-origin rotation would discard this convention, and its inertial
++        // output is the IMU body rather than the scene camera.
++        Sophus::SE3f Twc = (*pose * parentChain * keyframe->GetPose()).inverse();
++        const auto t = Twc.translation();
++        const auto q = Twc.unit_quaternion();
++        const bool metric = map->isImuInitialized();
++        out << *time << ',' << map->GetId() << ',' << metric << ','
++            << t.x() << ',' << t.y() << ',' << t.z() << ','
++            << q.x() << ',' << q.y() << ',' << q.z() << ',' << q.w() << '\n';
++        metricFrames += metric;
++    }
++    return metricFrames;
++}
++
+ void System::SaveTrajectoryEuRoC(const string &filename)
+ {
+
+     cout << endl << "Saving trajectory to " << filename << " ..." << endl;
