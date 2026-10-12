@@ -14,6 +14,7 @@ Requires: pip install transformers  (only for this test)
 """
 
 import unittest
+from pathlib import Path
 
 import torch
 
@@ -40,7 +41,18 @@ _shared_forward_result = None
 _shared_forward_img = None
 
 
+def _require_checkpoint():
+    checkpoint = (
+        Path(__file__).resolve().parents[1]
+        / "ckpts"
+        / "owlv2-base-patch16-ensemble.pt"
+    )
+    if not checkpoint.is_file():
+        raise unittest.SkipTest("OWLv2 checkpoint not installed (see README)")
+
+
 def _get_wrapper():
+    _require_checkpoint()
     global _shared_wrapper
     if _shared_wrapper is None:
         _shared_wrapper = OwlWrapper(
@@ -68,6 +80,7 @@ class TestOwlMatchesTransformers(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        _require_checkpoint()
         from transformers import Owlv2ForObjectDetection, Owlv2Processor
 
         cls.model_name = "google/owlv2-base-patch16-ensemble"
@@ -224,6 +237,7 @@ class TestTextEmbedder(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        _require_checkpoint()
         from owl.clip_tokenizer import TextEmbedder
 
         cls.embedder = TextEmbedder()

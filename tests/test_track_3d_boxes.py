@@ -4,6 +4,7 @@
 
 """Tests for utils/track_3d_boxes.py — 3D bounding box tracker."""
 
+import pytest
 import torch
 
 from utils.track_3d_boxes import (
@@ -13,6 +14,14 @@ from utils.track_3d_boxes import (
 )
 from utils.tw.obb import make_obb
 from utils.tw.tensor_utils import pad_string, string2tensor
+
+
+@pytest.fixture(autouse=True)
+def no_pretrained_embeddings(monkeypatch):
+    """Lifecycle unit tests do not load pretrained semantic embeddings."""
+    monkeypatch.setattr(
+        "utils.fuse_3d_boxes._load_cached_text_embeddings", lambda: {}
+    )
 
 
 def _make_det(position, sz=(1.0, 1.0, 1.0), prob=0.9, yaw=0.0, text="chair"):

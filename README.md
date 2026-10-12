@@ -547,3 +547,9 @@ If you find Boxer useful in your research, please consider citing:
 ## License
 
 The majority of Boxer is licensed under CC-BY-NC. See the [LICENSE](LICENSE) file for details. However portions of the project are available under separate license terms: see [NOTICE](NOTICE).
+
+## Continuous integration
+
+Every push and pull request runs the CPU test suite in GitHub Actions.
+See [CI setup and Remote SSH workflow](docs/ci.md) for checks, optional model
+tests, local execution and result inspection.
