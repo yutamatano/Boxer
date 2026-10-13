@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from convert_neon_trajectory import convert
+from evaluate_neon_geometry import evaluate
 from utils.neon_vio import read_csv, recording_path, write_json
 
 ROOT = Path(__file__).resolve().parent
@@ -73,6 +74,82 @@ def run_boxer_segments(summary, out, args):
         write_json(out / "pipeline.json", summary)
 
 
+def uncovered_intervals(frame_ids, segments):
+    """Partition actual selected source IDs; never infer a pose across a gap."""
+    ids = [int(i) for i in frame_ids]
+    if not ids or any(b <= a for a, b in zip(ids[:-1], ids[1:])):
+        raise ValueError("Selected frame IDs must be nonempty and strictly increasing")
+    covered = set()
+    for segment in segments:
+        interval = set(range(segment["start_n"], segment["start_n"] + segment["max_n"]))
+        if interval & covered or not interval <= set(ids):
+            raise ValueError("Metric intervals overlap or lie outside selected frames")
+        covered |= interval
+    missing = [i for i in ids if i not in covered]
+    runs = []
+    for frame_id in missing:
+        if runs and frame_id == runs[-1]["start_n"] + runs[-1]["max_n"]:
+            runs[-1]["max_n"] += 1
+        else:
+            runs.append({"start_n": frame_id, "max_n": 1})
+    return runs
+
+
+def run_frame_estimates(summary, out, args):
+    recording = Path(summary["recording"])
+    frames = read_csv(Path(summary["prepared"]) / "frames.csv")
+    intervals = uncovered_intervals(
+        [row["frame_id"] for row in frames], summary["segments"]
+    )
+    summary["frame_only_intervals"] = []
+    for i, interval in enumerate(intervals):
+        results = out / f"frame_only_{i:03d}"
+        command = [
+            sys.executable,
+            ROOT / "run_boxer.py",
+            "--input",
+            recording,
+            "--start_n",
+            interval["start_n"],
+            "--max_n",
+            interval["max_n"],
+            "--skip_n",
+            1,
+            "--point_cloud",
+            "off",
+            "--output_dir",
+            results,
+            "--labels",
+            args.labels,
+        ]
+        if args.force_cpu:
+            command += ["--force_cpu"]
+        run_logged(command, out / f"frame_only_{i:03d}.log")
+        summary["frame_only_intervals"].append(
+            dict(
+                interval,
+                results=str(results / recording.name),
+                coordinate_frame="per_frame_assumed_upright",
+                camera_trajectory_available=False,
+            )
+        )
+        summary["frame_only_frames"] = sum(
+            s["max_n"] for s in summary["frame_only_intervals"]
+        )
+        summary["total_estimated_frames"] = (
+            summary["usable_frames"] + summary["frame_only_frames"]
+        )
+        write_json(out / "pipeline.json", summary)
+
+
+def evaluate_segments(summary, out, reference=None):
+    for i, segment in enumerate(summary["segments"]):
+        output = out / f"geometry_evaluation_{i:03d}.json"
+        evaluate(summary["prepared"], segment["geometry"], output, reference)
+        segment["evaluation"] = str(output)
+    write_json(out / "pipeline.json", summary)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True)
@@ -97,6 +174,15 @@ def main():
     parser.add_argument("--labels", default="lvisplus")
     parser.add_argument("--force_cpu", action="store_true")
     parser.add_argument("--fuse", action="store_true")
+    parser.add_argument(
+        "--frame-fallback",
+        action="store_true",
+        help="Process untracked frames as independent local 3D estimates",
+    )
+    parser.add_argument(
+        "--reference",
+        help="Independent reference trajectory NPZ for accuracy evaluation",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--vio-only", action="store_true")
     mode.add_argument(
@@ -110,12 +196,14 @@ def main():
         out = Path(args.output).expanduser().resolve()
         if args.boxer_only:
             summary = json.loads((out / "pipeline.json").read_text())
-            if (
-                Path(summary["recording"]).resolve() != recording
-                or not summary["segments"]
+            if Path(summary["recording"]).resolve() != recording or (
+                not summary["segments"] and not args.frame_fallback
             ):
                 raise ValueError("Existing pipeline has no matching usable recording")
             run_boxer_segments(summary, out, args)
+            evaluate_segments(summary, out, args.reference)
+            if args.frame_fallback:
+                run_frame_estimates(summary, out, args)
             print(f"Results: {out}")
             return
         if out.exists() and any(out.iterdir()):
@@ -252,12 +340,15 @@ def main():
         summary["usable_frames"] = sum(s["max_n"] for s in summary["segments"])
         summary["coverage"] = summary["usable_frames"] / len(frames)
         write_json(out / "pipeline.json", summary)
-        if not summary["segments"]:
+        if not summary["segments"] and not args.frame_fallback:
             raise ValueError(
                 f"No metric intervals. Inspect {out / 'pipeline.json'} and session logs"
             )
+        evaluate_segments(summary, out, args.reference)
         if not args.vio_only:
             run_boxer_segments(summary, out, args)
+            if args.frame_fallback:
+                run_frame_estimates(summary, out, args)
         print(f"Usable metric frames: {summary['usable_frames']}/{len(frames)}")
         print(f"Summary: {out / 'pipeline.json'}")
         print("Remote SSH: download the MP4 in VS Code, or forward port 8000 and run:")

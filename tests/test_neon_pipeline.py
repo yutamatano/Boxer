@@ -45,3 +45,53 @@ def test_resolve_single_imported_recording_without_guessing(tmp_path):
     (second / "Neon Scene Camera v1 ps1.mp4").touch()
     with pytest.raises(ValueError, match="Choose one"):
         recording_path(str(tmp_path))
+
+
+def test_untracked_intervals_preserve_source_gaps_and_reject_overlap():
+    import pytest
+
+    assert pipeline.uncovered_intervals(range(9), [{"start_n": 2, "max_n": 3}]) == [
+        {"start_n": 0, "max_n": 2},
+        {"start_n": 5, "max_n": 4},
+    ]
+    assert pipeline.uncovered_intervals([0, 1, 3, 4], []) == [
+        {"start_n": 0, "max_n": 2},
+        {"start_n": 3, "max_n": 2},
+    ]
+    with pytest.raises(ValueError, match="overlap"):
+        pipeline.uncovered_intervals(
+            range(9),
+            [
+                {"start_n": 2, "max_n": 3},
+                {"start_n": 4, "max_n": 2},
+            ],
+        )
+
+
+def test_frame_estimates_never_receive_world_poses_or_tracking(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        pipeline, "run_logged", lambda command, log: calls.append(command)
+    )
+    prepared = tmp_path / "prepared"
+    prepared.mkdir()
+    (prepared / "frames.csv").write_text("frame_id\n0\n1\n2\n3\n4\n")
+    summary = {
+        "recording": str(tmp_path / "recording"),
+        "prepared": str(prepared),
+        "segments": [{"start_n": 2, "max_n": 2}],
+        "usable_frames": 2,
+    }
+    pipeline.run_frame_estimates(
+        summary, tmp_path, SimpleNamespace(labels="chair", force_cpu=False)
+    )
+    assert len(calls) == 2
+    for command in calls:
+        assert "--neon_geometry" not in command
+        assert "--track" not in command and "--fuse" not in command
+        assert command[command.index("--point_cloud") + 1] == "off"
+    assert summary["total_estimated_frames"] == 5
+    assert summary["frame_only_frames"] == 3
+    assert all(
+        not r["camera_trajectory_available"] for r in summary["frame_only_intervals"]
+    )

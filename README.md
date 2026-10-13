@@ -250,7 +250,7 @@ for the diagnosis, outputs, and tested recording.
 # After building the adapter as described below; use a fresh output directory.
 python run_neon_pipeline.py --input neon_import_1 \
   --output output/neon_run_01 --max_n 618 \
-  --experimental-noise --imu-offset-ms 60 --fuse
+  --experimental-noise --imu-offset-ms 60 --frame-fallback --fuse
 ```
 
 Here `+60 ms` is an explicit **experimental setting for neon_import_1**, not a
@@ -259,6 +259,11 @@ inspect the independent-window synchronization diagnostics before changing it.
 `--fuse` runs fusion after online tracking, using the raw detection CSV.
 The resulting NPZ includes sparse SLAM points when available; Boxer uses them
 with `--point_cloud auto`. These are reconstructed points, not sensor depth.
+`--frame-fallback` also processes untracked input frames as independent local
+3D estimates in separate output directories, without world tracking or fusion.
+It does not increase metric trajectory coverage. The pipeline writes internal
+IMU/geometry checks per segment; `--reference` adds rigid, no-scale-fit error
+evaluation against an independently measured exact-timestamp trajectory NPZ.
 
 Install `scipy` in the Boxer Python environment for the rotation/synchronization
 and trajectory-conversion utilities (`uv pip install scipy`).

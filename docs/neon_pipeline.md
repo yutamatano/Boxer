@@ -20,6 +20,7 @@ python run_neon_pipeline.py \
   --width 800 \
   --imu-offset-ms 60 \
   --experimental-noise \
+  --frame-fallback \
   --fuse
 ```
 
@@ -37,7 +38,7 @@ python run_neon_pipeline.py \
 
 ```bash
 python run_neon_pipeline.py --input neon_import_1 \
-  --output output/neon_run_01 --boxer-only --fuse
+  --output output/neon_run_01 --boxer-only --frame-fallback --fuse
 ```
 
 `--prepared PATH` を指定すると既存の前処理を再利用します。その場合、
@@ -53,6 +54,8 @@ output/neon_run_01/
   session_000/geometry/      geometry_segment_*.npz、report.json
   session_001/...            追跡失敗後の再開セッション
   boxer_000/<recording>/     3D検出・追跡・融合CSV、MP4
+  frame_only_000/<recording>/ 未追跡フレームの独立した3D推定、MP4
+  geometry_evaluation_000.json IMU整合性と、基準がある場合の誤差評価
   pipeline.json             有効区間、点群数、カバー率、結果パス
 ```
 
@@ -61,6 +64,13 @@ output/neon_run_01/
 変換は実行時と最終マップの両方でIMU初期化済み、かつ追跡成功のフレームだけを
 採用します。未初期化・追跡失敗フレームを補間して埋めることはありません。
 区間ごとに原点が異なるので、独立したBoxer処理として出力します。
+
+`--frame-fallback` を指定すると、選択した入力フレームのうち有効な軌跡区間に
+含まれないフレームも推論します。これらの座標系は各フレームで独立した
+`per_frame_assumed_upright` であり、カメラ位置が計測できたという意味では
+ありません。点群・世界座標の追跡・融合は使わず、別のディレクトリへ保存します。
+`pipeline.json` の `coverage` は引き続き有効な世界軌跡の割合です。
+`frame_only_frames` と `total_estimated_frames` は独立して集計します。
 
 疎点群はSLAMが三角測量した点であり、深度センサーの測定ではありません。
 無効な点を除き、3キーフレーム以上で観測された点を出力します。
@@ -94,11 +104,42 @@ output/neon_run_01/
 - 幅1200・特徴点3000の比較では有効区間を得られず、+40 msの試験では
   69フレームでした。幅800・特徴点2000・+60 msでは117フレームを保存できました。
   SLAMのスレッドスケジューリングにより境界が変わることがあります。
+- 追加の+80 ms、800幅・特徴点4000、CLAHEコントラスト補正＋特徴点4000の
+  試験でも有効な30フレーム以上の区間は得られませんでした。
+  既存の117フレームの結果を採用し、失敗を隠すための閾値緩和はしていません。
 
 これらの修正は全618フレームの連続した軌跡や実寸精度を保証しません。
 記録時のぼけ・白飛びはコードで元に戻せず、IMUノイズと同期・外部パラメータの
 校正、外部基準軌跡による評価が残ります。点群付き3D物体推定の出力成功と、
 位置・サイズの精度検証は区別してください。
+
+## 評価方法
+
+有効な区間ごとに `geometry_evaluation_*.json` を自動生成します。
+ジャイロを実際の画像間隔で積分してカメラの相対回転と比較し、速度統計と
+疎点群の画像内投影数も記録します。これは同じIMUを使った内部整合性の検査で、
+絶対位置・距離・サイズの精度を測ったものではありません。
+117フレームの採用軌跡ではジャイロ回転残差の中央値が約0.146°、95%値が
+約0.410°でした。
+
+提供された `neon_import_1` と `neon_import_2` は元のセンサー記録であり、
+同じ記録の基準軌跡や実測した物体寸法は含まれていません。
+基準がない場合、評価ファイルの `reference_accuracy` は測定不能と明記します。
+
+独立に計測したNeonシーンカメラ軌跡がある場合は、
+`timestamps_ns`（元の正確なint64 ns）と `T_world_camera`（メートル単位の
+剛体変換）を含むNPZを `--reference` に指定できます。
+基準には評価する全フレームの正確な時刻が必要です。
+評価は最初のカメラ姿勢で座標原点・向きを合わせ、位置RMSEと回転誤差を計算します。
+スケールはフィットせず、メートル単位のスケール誤差が隠れないようにします。
+
+```bash
+python evaluate_neon_geometry.py \
+  --prepared output/neon_run_01/prepared \
+  --geometry output/neon_run_01/session_000/geometry/geometry_segment_000.npz \
+  --reference /path/to/independently_measured_reference.npz \
+  --output output/neon_run_01/reference_evaluation.json
+```
 
 ## VS Code Remote SSHから動画を開く
 
