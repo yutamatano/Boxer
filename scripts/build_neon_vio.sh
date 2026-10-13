@@ -15,12 +15,26 @@ fi
 if [[ $(git -C "$pangolin_dir" rev-parse HEAD) != "$pangolin_commit" ]]; then
     echo "Pangolin must be checked out at $pangolin_commit (v0.8)" >&2; exit 1
 fi
-for patch in export_neon.patch build_compat.patch; do
+# Upgrade an already-patched checkout, or apply the full patch to a clean one.
+if ! git -C "$orb_dir" apply --reverse --check "$project_dir/slam/export_neon.patch" 2>/dev/null; then
+    if git -C "$orb_dir" apply --check "$project_dir/slam/export_neon_points.patch" 2>/dev/null; then
+        git -C "$orb_dir" apply "$project_dir/slam/export_neon_points.patch"
+    else
+        git -C "$orb_dir" apply --check "$project_dir/slam/export_neon.patch"
+        git -C "$orb_dir" apply "$project_dir/slam/export_neon.patch"
+    fi
+fi
+for patch in build_compat.patch; do
     if ! git -C "$orb_dir" apply --reverse --check "$project_dir/slam/$patch" 2>/dev/null; then
         git -C "$orb_dir" apply --check "$project_dir/slam/$patch"
         git -C "$orb_dir" apply "$project_dir/slam/$patch"
     fi
 done
+# Explicit integer headers required by newer C++ standard libraries.
+if ! git -C "$pangolin_dir" apply --reverse --check "$project_dir/slam/pangolin_compat.patch" 2>/dev/null; then
+    git -C "$pangolin_dir" apply --check "$project_dir/slam/pangolin_compat.patch"
+    git -C "$pangolin_dir" apply "$project_dir/slam/pangolin_compat.patch"
+fi
 cmake_bin=$(command -v cmake || true)
 if [[ -z "$cmake_bin" ]]; then cmake_bin="$prefix_dir/bin/cmake"; fi
 export LD_LIBRARY_PATH="$prefix_dir/lib/x86_64-linux-gnu:$prefix_dir/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

@@ -2,19 +2,31 @@
 """Export continuous, metric ORB-SLAM3 camera-pose segments for NeonLoader."""
 
 import argparse
-from collections import Counter
 import json
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
 from utils.neon_vio import (
-    ORB_SLAM3_COMMIT, check_times, read_csv, split_valid_runs, write_json,
+    ORB_SLAM3_COMMIT,
+    check_times,
+    read_csv,
+    split_valid_runs,
+    write_json,
 )
 
 
-def convert(prepared, trajectory, states, output, min_frames=30):
+def convert(
+    prepared,
+    trajectory,
+    states,
+    output,
+    min_frames=30,
+    points=None,
+    allow_partial=False,
+):
     prepared, output = Path(prepared), Path(output)
     if min_frames < 2:
         raise ValueError("min_frames must be >= 2")
@@ -24,6 +36,22 @@ def convert(prepared, trajectory, states, output, min_frames=30):
     if manifest.get("pose_frame") != "scene_camera":
         raise ValueError("Expected scene-camera poses")
     frames = read_csv(prepared / "frames.csv")
+    prepared_count = len(frames)
+    state_rows = read_csv(states)
+    if allow_partial:
+        selected = {int(row["frame_id"]) for row in state_rows}
+        positions = [
+            i for i, row in enumerate(frames) if int(row["frame_id"]) in selected
+        ]
+        if (
+            not positions
+            or len(positions) != len(selected)
+            or positions != list(range(positions[0], positions[-1] + 1))
+        ):
+            raise ValueError(
+                "Partial tracking states must cover one contiguous prepared interval"
+            )
+        frames = [frames[i] for i in positions]
     frame_ids = np.array([int(row["frame_id"]) for row in frames], dtype=np.int64)
     times = np.array([int(row["time_ns"]) for row in frames], dtype=np.int64)
     check_times(times, "Source frames")
@@ -35,7 +63,7 @@ def convert(prepared, trajectory, states, output, min_frames=30):
     time_index = {stamp: i for i, stamp in enumerate(slam_times)}
     poses = [None] * len(frames)
     state_by_frame = {}
-    for row in read_csv(states):
+    for row in state_rows:
         index = int(row["frame_id"])
         if index in state_by_frame:
             raise ValueError("Duplicate frame ID in tracking states")
@@ -47,7 +75,9 @@ def convert(prepared, trajectory, states, output, min_frames=30):
         if float(row["slam_time_s"]) != slam_times[i]:
             raise ValueError("Tracking-state timestamp does not match prepared frame")
     ordered_states = [state_by_frame[int(index)] for index in frame_ids]
-    latencies = [float(row["track_ms"]) for row in state_by_frame.values() if "track_ms" in row]
+    latencies = [
+        float(row["track_ms"]) for row in state_by_frame.values() if "track_ms" in row
+    ]
     if latencies and (not np.isfinite(latencies).all() or min(latencies) < 0):
         raise ValueError("Invalid tracking latency")
     seen = set()
@@ -67,11 +97,19 @@ def convert(prepared, trajectory, states, output, min_frames=30):
             raise ValueError("Missing or mismatched tracking-state timestamp")
         # Final map initialization alone cannot certify pre-initialization frame
         # history. Require both the runtime and the final map to be metric.
-        if int(row["metric"]) != 1 or int(state["imu_initialized"]) != 1 or int(state["state"]) != 2:
+        if (
+            int(row["metric"]) != 1
+            or int(state["imu_initialized"]) != 1
+            or int(state["state"]) != 2
+        ):
             continue
         q = np.array([float(row[k]) for k in ("qx", "qy", "qz", "qw")])
         t = np.array([float(row[k]) for k in ("tx", "ty", "tz")])
-        if not np.isfinite(q).all() or not np.isfinite(t).all() or abs(np.linalg.norm(q) - 1) > 1e-3:
+        if (
+            not np.isfinite(q).all()
+            or not np.isfinite(t).all()
+            or abs(np.linalg.norm(q) - 1) > 1e-3
+        ):
             raise ValueError("Invalid metric camera pose")
         pose = np.eye(4)
         pose[:3, :3] = Rotation.from_quat(q).as_matrix()
@@ -85,6 +123,17 @@ def convert(prepared, trajectory, states, output, min_frames=30):
     # Runtime resets also split a run, even when maps subsequently merge.
     pairs = list(zip(map_ids.tolist(), runtime_maps.tolist()))
     runs = split_valid_runs(frame_ids, pairs, valid)
+    points_by_map = {}
+    point_ids = set()
+    if points is not None:
+        for row in read_csv(points):
+            key = (int(row["map_id"]), int(row["point_id"]))
+            xyz = np.array([float(row[k]) for k in ("x", "y", "z")])
+            if key in point_ids or key[0] < 0 or not np.isfinite(xyz).all():
+                raise ValueError("Invalid or duplicate map point")
+            point_ids.add(key)
+            if int(row["observations"]) >= 3:
+                points_by_map.setdefault(key[0], []).append(xyz)
     if output.exists() and any(output.iterdir()):
         raise ValueError(f"Output is not empty; choose a new directory: {output}")
     output.mkdir(parents=True, exist_ok=True)
@@ -94,32 +143,56 @@ def convert(prepared, trajectory, states, output, min_frames=30):
             continue
         transforms = np.stack([poses[i] for i in run])
         # Translate the origin only; retain ORB's gravity-aligned world axes.
-        transforms[:, :3, 3] -= transforms[0, :3, 3].copy()
+        origin = transforms[0, :3, 3].copy()
+        transforms[:, :3, 3] -= origin
+        map_points = points_by_map.get(int(map_ids[run[0]]), [])
+        geometry = {}
+        if map_points:
+            geometry["points_world"] = np.asarray(map_points) - origin
         dt = np.diff(times[run]).astype(np.float64) * 1e-9
         speed = np.linalg.norm(np.diff(transforms[:, :3, 3], axis=0), axis=1) / dt
         angles = Rotation.from_matrix(
             transforms[:-1, :3, :3].transpose(0, 2, 1) @ transforms[1:, :3, :3]
         ).magnitude()
         filename = f"geometry_segment_{len(segments):03d}.npz"
-        np.savez_compressed(output / filename, timestamps_ns=times[run],
-                            T_world_camera=transforms, source_frame_ids=frame_ids[run])
-        segments.append({
-            "file": filename, "start_n": int(frame_ids[run[0]]),
-            "max_n": len(run), "map_id": int(map_ids[run[0]]),
-            "runtime_map_id": int(runtime_maps[run[0]]),
-            "first_timestamp_ns": int(times[run[0]]), "last_timestamp_ns": int(times[run[-1]]),
-            "duration_s": float(np.sum(dt)),
-            "speed_m_s_p50_p99_max": np.percentile(speed, [50, 99, 100]).tolist(),
-            "rotation_step_deg_p50_p99_max": np.degrees(np.percentile(angles, [50, 99, 100])).tolist(),
-            "path_length_m": float(np.sum(speed * dt)),
-        })
+        np.savez_compressed(
+            output / filename,
+            timestamps_ns=times[run],
+            T_world_camera=transforms,
+            source_frame_ids=frame_ids[run],
+            **geometry,
+        )
+        segments.append(
+            {
+                "file": filename,
+                "start_n": int(frame_ids[run[0]]),
+                "max_n": len(run),
+                "map_id": int(map_ids[run[0]]),
+                "runtime_map_id": int(runtime_maps[run[0]]),
+                "point_count": len(map_points),
+                "first_timestamp_ns": int(times[run[0]]),
+                "last_timestamp_ns": int(times[run[-1]]),
+                "duration_s": float(np.sum(dt)),
+                "speed_m_s_p50_p99_max": np.percentile(speed, [50, 99, 100]).tolist(),
+                "rotation_step_deg_p50_p99_max": np.degrees(
+                    np.percentile(angles, [50, 99, 100])
+                ).tolist(),
+                "path_length_m": float(np.sum(speed * dt)),
+            }
+        )
     report = {
-        "schema_version": 1, "prepared": str(prepared.resolve()),
-        "trajectory": str(Path(trajectory).resolve()), "states": str(Path(states).resolve()),
+        "schema_version": 1,
+        "prepared": str(prepared.resolve()),
+        "trajectory": str(Path(trajectory).resolve()),
+        "states": str(Path(states).resolve()),
         "orb_slam3_commit": ORB_SLAM3_COMMIT,
-        "pose_frame": "scene_camera", "world_frame": "ORB gravity-aligned Z-up; translated origin",
-        "units": "metres", "timestamps": "original scene .time int64 ns",
-        "input_frames": len(frames), "metric_tracked_frames": int(valid.sum()),
+        "pose_frame": "scene_camera",
+        "world_frame": "ORB gravity-aligned Z-up; translated origin",
+        "units": "metres",
+        "timestamps": "original scene .time int64 ns",
+        "prepared_frames": prepared_count,
+        "input_frames": len(frames),
+        "metric_tracked_frames": int(valid.sum()),
         "runtime_metric_ok_frames": sum(
             row["state"] == "2" and row["imu_initialized"] == "1"
             for row in ordered_states
@@ -130,12 +203,24 @@ def convert(prepared, trajectory, states, output, min_frames=30):
             previous["imu_initialized"] == "1" and current["imu_initialized"] == "0"
             for previous, current in zip(ordered_states, ordered_states[1:])
         ),
-        "tracking_state_counts": dict(Counter(row["state"] for row in state_by_frame.values())),
+        "tracking_state_counts": dict(
+            Counter(row["state"] for row in state_by_frame.values())
+        ),
         "runtime_map_count": len(set(row["map_id"] for row in state_by_frame.values())),
-        "tracking_latency_ms_p50_p99_max": np.percentile(latencies, [50, 99, 100]).tolist() if latencies else None,
-        "coverage": float(valid.mean()), "min_frames": min_frames,
-        "excluded_frames": int((~valid).sum()), "segments": segments,
-        "interpolated_frames": 0, "points_exported": False,
+        "tracking_latency_ms_p50_p99_max": np.percentile(
+            latencies, [50, 99, 100]
+        ).tolist()
+        if latencies
+        else None,
+        "coverage": float(valid.mean()),
+        "min_frames": min_frames,
+        "excluded_frames": int((~valid).sum()),
+        "segments": segments,
+        "trajectory_rows": len(seen),
+        "longest_metric_run_frames": max((len(run) for run in runs), default=0),
+        "interpolated_frames": 0,
+        "points_exported": any(s["point_count"] for s in segments),
+        "points_source": str(Path(points).resolve()) if points is not None else None,
         "imu_noise_source": manifest.get("imu_noise_source"),
         "extrinsics_source": manifest.get("extrinsics_source"),
         "physical_synchronization": manifest.get("physical_synchronization"),
@@ -143,9 +228,30 @@ def convert(prepared, trajectory, states, output, min_frames=30):
     }
     write_json(output / "report.json", report)
     if not segments:
-        raise ValueError(f"No continuous metric segment >= {min_frames} frames; inspect {output / 'report.json'}")
+        if not seen:
+            reason = (
+                "SLAM exported no camera poses; rerun camera trajectory estimation. "
+                "Lowering --min-frames cannot fix an empty trajectory"
+            )
+        elif not valid.any():
+            reason = (
+                "No poses passed runtime/final metric tracking checks; "
+                "inspect SLAM initialization and resets"
+            )
+        else:
+            reason = (
+                "Longest valid continuous segment is "
+                f"{report['longest_metric_run_frames']} frames"
+            )
+        raise ValueError(
+            f"No continuous metric segment >= {min_frames} frames: {reason}; "
+            f"inspect {output / 'report.json'}"
+        )
     for segment in segments:
-        print(f"{output / segment['file']}: --start_n {segment['start_n']} --max_n {segment['max_n']}")
+        print(
+            f"{output / segment['file']}: --start_n {segment['start_n']} "
+            f"--max_n {segment['max_n']}"
+        )
     print(f"Metric tracking coverage: {valid.sum()}/{len(frames)} ({valid.mean():.1%})")
     return report
 
@@ -157,9 +263,25 @@ def main():
     parser.add_argument("--states", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--min-frames", type=int, default=30)
+    parser.add_argument(
+        "--points", help="Final map_points.csv from the same SLAM session"
+    )
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="Accept a contiguous processed interval of the prepared input",
+    )
     args = parser.parse_args()
     try:
-        convert(args.prepared, args.trajectory, args.states, args.output, args.min_frames)
+        convert(
+            args.prepared,
+            args.trajectory,
+            args.states,
+            args.output,
+            args.min_frames,
+            args.points,
+            args.allow_partial,
+        )
     except (ValueError, OSError, KeyError) as exc:
         parser.error(str(exc))
 

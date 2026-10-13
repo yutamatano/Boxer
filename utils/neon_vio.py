@@ -9,7 +9,6 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-
 ORB_SLAM3_COMMIT = "4452a3c4ab75b1cde34e5505a36ec3f9edcdc4c4"
 
 
@@ -19,6 +18,13 @@ def recording_path(value):
         path = Path(__file__).resolve().parents[1] / "sample_data" / value
     if not path.is_dir():
         raise ValueError(f"Recording directory not found: {value}")
+    if not any(path.glob("Neon Scene Camera v1 ps*.mp4")):
+        children = sorted(
+            {p.parent for p in path.glob("*/Neon Scene Camera v1 ps*.mp4")}
+        )
+        if len(children) != 1:
+            raise ValueError("Choose one Neon recording folder containing scene video")
+        path = children[0]
     return path.resolve()
 
 
@@ -81,7 +87,9 @@ def imu_in_si(imu):
     gyro = np.asarray(imu.angular_velocity, dtype=np.float64) * np.pi / 180
     accel = np.asarray(imu.acceleration, dtype=np.float64) * 9.80665
     if gyro.ndim != 2 or gyro.shape[1] != 3 or accel.shape != gyro.shape:
-        raise ValueError("IMU acceleration and angular velocity must be matching Nx3 arrays")
+        raise ValueError(
+            "IMU acceleration and angular velocity must be matching Nx3 arrays"
+        )
     if not np.isfinite(gyro).all() or not np.isfinite(accel).all():
         raise ValueError("IMU contains nonfinite acceleration or angular velocity")
     return gyro, accel
@@ -114,8 +122,15 @@ def write_orb_settings(path, settings, transform):
         lines.append(f"{key}: {encoded}")
     transform = validate_transform(transform)
     # Upstream Converter reads this matrix through cv::Mat::at<float>.
-    lines.extend(["IMU.T_b_c1: !!opencv-matrix", "   rows: 4", "   cols: 4",
-                  "   dt: f", "   data: " + json.dumps(transform.ravel().tolist())])
+    lines.extend(
+        [
+            "IMU.T_b_c1: !!opencv-matrix",
+            "   rows: 4",
+            "   cols: 4",
+            "   dt: f",
+            "   data: " + json.dumps(transform.ravel().tolist()),
+        ]
+    )
     Path(path).write_text("\n".join(lines) + "\n")
 
 

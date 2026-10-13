@@ -1,0 +1,52 @@
+--- a/include/System.h
++++ b/include/System.h
+@@ -176,6 +176,8 @@
+     // Neon adapter: current map state and final gravity-aligned CAMERA poses.
+     std::pair<long, bool> GetNeonMapState();
+     size_t SaveNeonCameraTrajectory(const string &filename);
++    size_t SaveNeonMapPoints(const string &filename);
++    bool NeonResetPending();
+
+     int GetTrackingState();
+     std::vector<MapPoint*> GetTrackedMapPoints();
+--- a/src/System.cc
++++ b/src/System.cc
+@@ -664,6 +664,38 @@
+     Map* map = mpAtlas->GetCurrentMap();
+     return map ? std::make_pair(static_cast<long>(map->GetId()), map->isImuInitialized())
+                : std::make_pair(-1L, false);
++}
++
++bool System::NeonResetPending()
++{
++    unique_lock<mutex> lock(mMutexReset);
++    return mbReset || mbResetActiveMap;
++}
++
++size_t System::SaveNeonMapPoints(const string &filename)
++{
++    // SaveNeonCameraTrajectory must first stop and join all writers.
++    if (!isShutDown() || !mpLocalMapper->isFinished()
++        || !mpLoopCloser->isFinished() || mpLoopCloser->isRunningGBA())
++        throw std::runtime_error("Export trajectory before map points");
++    ofstream out(filename);
++    if (!out) throw std::runtime_error("Cannot write Neon map points");
++    out << "map_id,point_id,x,y,z,observations\n" << setprecision(17);
++    size_t count = 0;
++    for (Map* map : mpAtlas->GetAllMaps())
++    {
++        if (!map || !map->isImuInitialized()) continue;
++        for (MapPoint* point : map->GetAllMapPoints())
++        {
++            if (!point || point->isBad() || point->Observations() < 3) continue;
++            const auto p = point->GetWorldPos();
++            if (!p.allFinite()) continue;
++            out << map->GetId() << ',' << point->mnId << ',' << p.x() << ','
++                << p.y() << ',' << p.z() << ',' << point->Observations() << '\n';
++            ++count;
++        }
++    }
++    return count;
+ }
+
+ size_t System::SaveNeonCameraTrajectory(const string &filename)

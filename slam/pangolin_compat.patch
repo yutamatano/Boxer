@@ -1,0 +1,13 @@
+--- a/components/pango_image/src/image_io_bmp.cpp
++++ b/components/pango_image/src/image_io_bmp.cpp
+@@ -1,2 +1,3 @@
++#include <cstdint>
+ #include <fstream>
+ #include <pangolin/image/typed_image.h>
+--- a/components/pango_packetstream/include/pangolin/log/packetstream_tags.h
++++ b/components/pango_packetstream/include/pangolin/log/packetstream_tags.h
+@@ -1,3 +1,4 @@
+ #pragma once
++#include <cstdint>
+
+ #include <string>

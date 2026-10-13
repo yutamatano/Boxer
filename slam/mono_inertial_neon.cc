@@ -37,21 +37,33 @@ std::vector<std::vector<std::string>> rows(const fs::path& path) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 4 || argc > 5) {
-        std::cerr << "Usage: mono_inertial_neon VOCABULARY PREPARED OUTPUT [PACE]\n"
+    if (argc < 4) {
+        std::cerr << "Usage: mono_inertial_neon VOCABULARY PREPARED OUTPUT [PACE] [--stop-on-metric-loss] [--start-index N]\n"
                   << "PACE=1: real-time scheduling; 0: fastest (may starve mapping)\n";
         return 1;
     }
     try {
         const fs::path vocabulary = fs::absolute(argv[1]);
         const fs::path prepared = fs::absolute(argv[2]), output = fs::absolute(argv[3]);
-        const double pace = argc == 5 ? std::stod(argv[4]) : 1.0;
+        double pace = 1.0;
+        size_t startIndex = 0;
+        bool stopOnMetricLoss = false;
+        for (int arg = 4; arg < argc; ++arg) {
+            const std::string value = argv[arg];
+            if (value == "--stop-on-metric-loss") stopOnMetricLoss = true;
+            else if (value == "--start-index" && arg + 1 < argc) {
+                const long index = std::stol(argv[++arg]);
+                if (index < 0) throw std::runtime_error("Invalid start index");
+                startIndex = static_cast<size_t>(index);
+            } else if (arg == 4 && value.rfind("--", 0) != 0) pace = std::stod(value);
+            else throw std::runtime_error("Unknown option: " + value);
+        }
         if (!std::isfinite(pace) || pace < 0) throw std::runtime_error("Invalid pace");
         if (fs::exists(output) && !fs::is_empty(output))
             throw std::runtime_error("Output must be an empty directory");
         std::vector<Frame> frames;
         for (const auto& row : rows(prepared / "frames.csv")) {
-            if (row.size() != 7) throw std::runtime_error("Invalid frames.csv row");
+            if (row.size() < 7) throw std::runtime_error("Invalid frames.csv row");
             frames.push_back({std::stol(row[0]), std::stod(row[3]), row[4]});
         }
         std::vector<Sample> imu;
@@ -69,7 +81,7 @@ int main(int argc, char** argv) {
             sample.accel = cv::Point3f(values[3], values[4], values[5]);
             imu.push_back(sample);
         }
-        if (frames.size() < 2 || imu.size() < 2) throw std::runtime_error("Not enough input");
+        if (frames.size() < 2 || startIndex >= frames.size() - 1 || imu.size() < 2) throw std::runtime_error("Not enough input");
         for (size_t i = 0; i < frames.size(); ++i)
             if (!std::isfinite(frames[i].time) || (i && (frames[i].time <= frames[i-1].time || frames[i].id != frames[i-1].id + 1)))
                 throw std::runtime_error("Nonfinite/noncontiguous source frames");
@@ -88,12 +100,16 @@ int main(int argc, char** argv) {
         cv::setNumThreads(2);
         ORB_SLAM3::System slam(vocabulary.string(), (prepared / "camera.yaml").string(),
                                ORB_SLAM3::System::IMU_MONOCULAR, false);
-        size_t next = 0, metricOK = 0;
+        size_t next = static_cast<size_t>(std::lower_bound(imu.begin(), imu.end(), frames[startIndex].time,
+            [](const Sample& sample, double time) { return sample.time < time; }) - imu.begin());
+        if (next) --next; // The first image also needs an IMU sample before it.
+        size_t metricOK = 0, processed = 0;
+        bool stoppedOnLoss = false;
         const auto wallStart = std::chrono::steady_clock::now();
-        for (size_t i = 0; i < frames.size(); ++i) {
+        for (size_t i = startIndex; i < frames.size(); ++i) {
             const Frame& frame = frames[i];
             if (pace > 0) {
-                const auto target = wallStart + std::chrono::duration<double>((frame.time - frames.front().time) * pace);
+                const auto target = wallStart + std::chrono::duration<double>((frame.time - frames[startIndex].time) * pace);
                 std::this_thread::sleep_until(target);
             }
             cv::Mat image = cv::imread((prepared / frame.image).string(), cv::IMREAD_GRAYSCALE);
@@ -117,10 +133,27 @@ int main(int argc, char** argv) {
             states << frame.id << ',' << frame.time << ',' << state << ',' << mappedFeatures << ',' << map.second << ',' << map.first << ',' << milliseconds << '\n';
             states.flush();
             metricOK += state == 2 && map.second;
+            ++processed;
+            // The reset is executed at the beginning of the NEXT TrackMonocular.
+            // Finalize while the initialized map and its optimized history exist.
+            if (stopOnMetricLoss && metricOK &&
+                (state != 2 || !map.second || slam.NeonResetPending())) {
+                stoppedOnLoss = true;
+                std::cout << "Saving metric segment before reset at source frame " << frame.id << std::endl;
+                break;
+            }
             if (i % 100 == 0) std::cout << "Neon frame " << i << '/' << frames.size() << " state=" << state << " mapped_features=" << mappedFeatures << " metric=" << map.second << std::endl;
         }
         slam.Shutdown();
         const size_t finalMetric = slam.SaveNeonCameraTrajectory((output / "camera_trajectory.csv").string());
+        const size_t points = slam.SaveNeonMapPoints((output / "map_points.csv").string());
+        std::ofstream summary(output / "run.json");
+        summary << "{\"start_index\":" << startIndex
+                << ",\"processed_frames\":" << processed
+                << ",\"next_index\":" << startIndex + processed
+                << ",\"stopped_on_metric_loss\":" << (stoppedOnLoss ? "true" : "false")
+                << ",\"final_metric_poses\":" << finalMetric
+                << ",\"map_points\":" << points << "}\n";
         std::cout << "Final metric camera poses: " << finalMetric << "; runtime metric OK frames: " << metricOK << '/' << frames.size() << std::endl;
         return finalMetric && metricOK ? 0 : 3;
     } catch (const std::exception& error) {

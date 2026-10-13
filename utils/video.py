@@ -6,6 +6,7 @@
 import os
 import shutil
 import subprocess
+import tempfile
 
 
 def cmd_exists(cmd):
@@ -41,8 +42,8 @@ def find_ffmpeg(home, ffmpeg_binary=None):
     options = [
         "/usr/bin/ffmpeg",  # Better version on AWS than conda
         "ffmpeg",  # Normal installation will have this in the path (e.g. local machine)
-        "/usr/local/fbprojects/fb-motion2/ffmpeg/bin/ffmpeg",  # OD comes with it pre-installed here.
-        "/usr/local/fbprojects/ffmpeg-ref/ffmpeg/bin/ffmpeg",  # Some OD comes with this path.
+        "/usr/local/fbprojects/fb-motion2/ffmpeg/bin/ffmpeg",
+        "/usr/local/fbprojects/ffmpeg-ref/ffmpeg/bin/ffmpeg",
         "%s/ffmpeg/ffmpeg/bin/ffmpeg" % home,
     ]  # Devserver README instruction location.
     if ffmpeg_binary is None:
@@ -54,26 +55,20 @@ def find_ffmpeg(home, ffmpeg_binary=None):
         assert cmd_exists(ffmpeg_binary), "Provided --ffmpeg_binary does not exist"
 
     if ffmpeg_binary is None:
-        raise IOError(
-            "Cannot auto find ffmpeg binary, please see the README for installation help"
-        )
+        raise IOError("Cannot find ffmpeg; see the README for installation help")
     return ffmpeg_binary
 
 
-def get_video_codec():
-    ffmpeg_binary = find_ffmpeg(os.path.expanduser("~"))
-    cmd = f"{ffmpeg_binary} -y -v quiet -codecs | grep 264"
-    result = str(subprocess.check_output(cmd, shell=True))
-    # "libfdk_aac" is better than "aac" because it works with quicktime
-    # If libfdk_aac is available, lets use it. On fedora desktop, it is not
-    # available unless you install from source, so use "aac" instead.
-    if "libx264" in result:  # available on OD-GPU
-        codec = "libx264"
-    elif "h264" in result:  # available on fedora
-        codec = "h264"
-    else:
-        raise ValueError("Cannot find a valid audio decoder")
-    return codec
+def get_video_codec(ffmpeg_binary=None):
+    ffmpeg_binary = find_ffmpeg(os.path.expanduser("~"), ffmpeg_binary)
+    result = subprocess.check_output(
+        [ffmpeg_binary, "-hide_banner", "-encoders"],
+        text=True,
+        stderr=subprocess.STDOUT,
+    )
+    if "libx264" not in result:
+        raise ValueError("FFmpeg needs the libx264 video encoder to write MP4")
+    return "libx264"
 
 
 def make_mp4(
@@ -91,17 +86,45 @@ def make_mp4(
     if output_dir is None:
         output_dir = input_dir
     mp4_path = os.path.join(output_dir, output_name)
-    video_codec = get_video_codec()
-    cmd = (
-        f"{ffmpeg_binary} -hide_banner -loglevel error -y "
-        f"-framerate {framerate} -pattern_type glob "
-        f"-i '{input_dir}/{image_glob}' "
-        f"-vf 'scale=trunc(iw/2)*2:trunc(ih/2)*2' "
-        f"-c:v {video_codec} -preset {preset} -crf {crf} "
-        f"-profile:v high -level 4.1 "
-        f"-pix_fmt yuv420p -movflags +faststart "
-        f"{mp4_path}"
-    )
-    print(cmd)
-    subprocess.run(cmd, shell=True)
+    video_codec = get_video_codec(ffmpeg_binary)
+    os.makedirs(output_dir, exist_ok=True)
+    # Keep a prior completed video if encoding fails. Avoid shell interpretation
+    # of recording names, and let x264 choose a level valid for the resolution/FPS.
+    fd, temporary = tempfile.mkstemp(suffix=".mp4", dir=output_dir)
+    os.close(fd)
+    cmd = [
+        ffmpeg_binary,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-framerate",
+        str(framerate),
+        "-pattern_type",
+        "glob",
+        "-i",
+        os.path.join(input_dir, image_glob),
+        "-vf",
+        "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+        "-c:v",
+        video_codec,
+        "-preset",
+        preset,
+        "-crf",
+        str(crf),
+        "-profile:v",
+        "main",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        temporary,
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+        os.replace(temporary, mp4_path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    print(f"Video: {mp4_path}")
     return mp4_path

@@ -235,9 +235,30 @@ thus loses both measured depth input and point-based visibility evidence.
 ### Estimate Neon camera poses from scene video and IMU
 
 The optional offline adapter uses **monocular-inertial ORB-SLAM3**. It does not
-change BoxerNet, the tracker, or fusion. Its outputs are continuous pose-only
+change BoxerNet, the tracker, or fusion. Its outputs are continuous camera-pose and optional sparse-map
 segments that the existing `--neon_geometry` option accepts. This does not add
 Neon support to the interactive `view_tracker.py` loader.
+
+The recommended end-to-end entry point is now `run_neon_pipeline.py`.
+It stops a SLAM session at the first loss/reset after metric initialization,
+exports the optimized camera poses and sparse map before they are erased,
+and restarts on the remaining source frames. Each valid interval is converted
+and processed by Boxer separately. See [Neon / Remote SSH workflow](docs/neon_pipeline.md)
+for the diagnosis, outputs, and tested recording.
+
+```bash
+# After building the adapter as described below; use a fresh output directory.
+python run_neon_pipeline.py --input neon_import_1 \
+  --output output/neon_run_01 --max_n 618 \
+  --experimental-noise --imu-offset-ms 60 --fuse
+```
+
+Here `+60 ms` is an explicit **experimental setting for neon_import_1**, not a
+universal Neon calibration or a default. Other recordings default to zero offset;
+inspect the independent-window synchronization diagnostics before changing it.
+`--fuse` runs fusion after online tracking, using the raw detection CSV.
+The resulting NPZ includes sparse SLAM points when available; Boxer uses them
+with `--point_cloud auto`. These are reconstructed points, not sensor depth.
 
 Install `scipy` in the Boxer Python environment for the rotation/synchronization
 and trajectory-conversion utilities (`uv pip install scipy`).
@@ -290,12 +311,13 @@ export LD_LIBRARY_PATH="$PWD/output/neon_vio_deps/prefix/usr/lib/x86_64-linux-gn
 output/neon_vio_build/mono_inertial_neon \
   output/neon_vio_deps/ORB_SLAM3/Vocabulary/ORBvoc.txt \
   output/neon_vio/2026-09-30_15-22-47/prepared \
-  output/neon_vio/2026-09-30_15-22-47/slam
+  output/neon_vio/2026-09-30_15-22-47/slam --stop-on-metric-loss
 
 python convert_neon_trajectory.py \
   --prepared output/neon_vio/2026-09-30_15-22-47/prepared \
   --trajectory output/neon_vio/2026-09-30_15-22-47/slam/camera_trajectory.csv \
   --states output/neon_vio/2026-09-30_15-22-47/slam/states.csv \
+  --points output/neon_vio/2026-09-30_15-22-47/slam/map_points.csv --allow-partial \
   --output output/neon_vio/2026-09-30_15-22-47/geometry
 ```
 
@@ -341,8 +363,10 @@ python run_boxer.py --input 2026-09-30_15-22-47 \
 
 Each segment retains a right-handed Z-up world in metres and translates its
 first camera position to the origin. Different segments have independent
-origins and must not be fused together without registration. No point cloud
-is fabricated: phone depth can later supply registered `points_world`.
+origins and must not be fused together without registration. The adapter exports finite sparse SLAM points observed by at least three
+keyframes, when available. The converter applies the same origin translation
+to camera poses and map points. Phone depth can also supply registered
+`points_world`. These static map points are depth input, not per-frame visibility evidence.
 Absolute trajectory error cannot be measured without an external reference;
 monocular box depth/size remains unvalidated when points are disabled.
 
