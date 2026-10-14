@@ -506,6 +506,8 @@ from utils.video import make_mp4
 
 def build_seq_ctx(input_path, dataset_type):
     """Build viewer context from input path (creates loader for traj/calib/RGB)."""
+    if dataset_type == "neon":
+        raise ValueError("Use view_tracker.py --neon_geometry for Neon replay")
     if dataset_type == "aria":
         from loaders.aria_loader import AriaLoader
 
@@ -807,6 +809,11 @@ def resolve_input(input_str):
                 input_path = sample
             elif os.path.exists(legacy):
                 input_path = legacy
+        from utils.neon_viewer import resolve_neon_recording
+
+        recording = resolve_neon_recording(input_path)
+        if recording is not None:
+            return str(recording), "neon", recording.name
         seq_name = input_path.rstrip("/").split("/")[-1]
         return input_path, "aria", seq_name
 
@@ -2984,6 +2991,7 @@ class SequenceOBBViewer(OBBViewer):
                     )
                 self._data_source = seq_ctx_data.get("source", "aria")
                 source_name = {
+                    "neon": "NeonLoader",
                     "ca1m": "CALoader",
                     "scannet": "ScanNetLoader",
                     "omni3d": "OmniLoader",
@@ -3088,6 +3096,8 @@ class SequenceOBBViewer(OBBViewer):
         else:
             idx = int(find_nearest2(self._rgb_timestamps, ts_ns))
             ts_key = int(self._rgb_timestamps[idx])
+        if getattr(self, "_data_source", None) == "neon" and ts_key != int(ts_ns):
+            return None
         if ts_key in self._rgb_lru_cache:
             img = self._rgb_lru_cache[ts_key]
             self._rgb_lru_cache.move_to_end(ts_key)
@@ -3141,7 +3151,8 @@ class SequenceOBBViewer(OBBViewer):
                 if len(self._rgb_lru_cache) > self._rgb_lru_max_items:
                     self._rgb_lru_cache.popitem(last=False)
         elif (
-            getattr(self, "_data_source", None) == "omni3d" and self._loader is not None
+            getattr(self, "_data_source", None) in ("omni3d", "neon")
+            and self._loader is not None
         ):
             datum = self._loader.load(idx)
             img_t = datum["img0"][0].permute(1, 2, 0).cpu().numpy()
@@ -3437,6 +3448,11 @@ class SequenceOBBViewer(OBBViewer):
             return None, None
         if len(self.pose_ts) == 0 or len(self.calib_ts) == 0:
             return None, None
+        if getattr(self, "_data_source", None) == "neon":
+            idx = int(np.searchsorted(self.pose_ts, ts_ns))
+            if idx == len(self.pose_ts) or int(self.pose_ts[idx]) != int(ts_ns):
+                return None, None
+            return self.calibs[idx].float(), self.traj[idx].float()
         if getattr(self, "_data_source", None) == "ca1m":
             if len(self._rgb_timestamps) > 0:
                 idx = int(find_nearest2(self._rgb_timestamps, ts_ns))
@@ -4058,6 +4074,7 @@ class TrackerViewer(SequenceOBBViewer):
                 )
             self._data_source = seq_ctx.get("source", "aria")
             source_name = {
+                "neon": "NeonLoader",
                 "ca1m": "CALoader",
                 "scannet": "ScanNetLoader",
             }.get(self._data_source, "AriaLoader")
@@ -4083,13 +4100,13 @@ class TrackerViewer(SequenceOBBViewer):
                 )
             else:
                 print(
-                    f"Loaded CA1M with {self._rgb_num_frames} RGB frames from {seq_name}"
+                    f"Loaded {source_name} with {self._rgb_num_frames} RGB frames from {seq_name}"
                 )
             print(
-                f"Loaded trajectory with {len(self.traj) if self.traj is not None else 0} poses via AriaLoader"
+                f"Loaded trajectory with {len(self.traj) if self.traj is not None else 0} poses via {source_name}"
             )
             print(
-                f"Loaded online calibration with {len(self.calibs) if self.calibs is not None else 0} entries via AriaLoader"
+                f"Loaded calibration with {len(self.calibs) if self.calibs is not None else 0} entries via {source_name}"
             )
             # Optional semidense maps from AriaLoader
             self._aria_uid_to_p3 = seq_ctx.get("uid_to_p3", None)
@@ -4108,6 +4125,8 @@ class TrackerViewer(SequenceOBBViewer):
                 f"Tracker sequence context applied in {(time_module.perf_counter() - t_ctx0):.2f}s"
             )
         except Exception as e:
+            if self._prebuilt_seq_ctx and self._prebuilt_seq_ctx.get("source") == "neon":
+                raise
             self._vrs_is_nebula = False
             self._rgb_images = None
             self._loader = None
@@ -4747,7 +4766,10 @@ class TrackerViewer(SequenceOBBViewer):
 
         # Also check nearby timestamps (observations may not align exactly)
         # Use the nearest observation timestamp within 1ms
-        if not observed_uids and len(self._all_obs_timestamps) > 0:
+        if (
+            not observed_uids and len(self._all_obs_timestamps) > 0
+            and getattr(self, "_data_source", None) != "neon"
+        ):
             nearest_idx = find_nearest2(self._all_obs_timestamps, ts_ns)
             nearest_ts = int(self._all_obs_timestamps[nearest_idx])
             if abs(nearest_ts - ts_ns) < 1_000_000:  # within 1ms
@@ -5117,8 +5139,12 @@ class TrackerViewer(SequenceOBBViewer):
         if self._bb2d_data is not None and self._bb2d_timestamps is not None:
             idx = int(find_nearest2(self._bb2d_timestamps, ts))
             nearest_ts = int(self._bb2d_timestamps[idx])
-            # Only use if within 50ms tolerance
-            if abs(nearest_ts - ts) < 50_000_000:
+            # Neon uses the exact source clock; other datasets retain 50ms tolerance.
+            matched = (
+                nearest_ts == ts if self._data_source == "neon"
+                else abs(nearest_ts - ts) < 50_000_000
+            )
+            if matched:
                 entry = self._bb2d_data[nearest_ts]
                 bb2d = entry["bb2d"]  # (N, 4) x1,y1,x2,y2
                 labels = entry["labels"]
@@ -6264,6 +6290,11 @@ class TrackerViewer(SequenceOBBViewer):
             )
             imgui.text(f"FPS: {self._fps_display:.1f}")
             imgui.text(f"Frame: {self.current_frame_idx + 1} / {self.total_frames}")
+            if self._data_source == "neon":
+                ts = self.sorted_timestamps[self.current_frame_idx]
+                idx = int(np.searchsorted(self._rgb_timestamps, ts))
+                source_id = self._loader.frame_indices[idx]
+                imgui.text(f"Source frame: {source_id} | Time ns: {ts}")
             imgui.text(
                 f"Detections: {self._current_detection_count}  Active: {self._active_track_count}  Total: {self._total_track_count}"
             )

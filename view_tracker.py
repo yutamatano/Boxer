@@ -39,7 +39,13 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Enable verbose tracker logging")
     parser.add_argument("--bb2d_csv", type=str, default="", help="2D BB CSV filename (relative to log_dir)")
     # fmt: on
+    parser.add_argument(
+        "--neon_geometry", type=str,
+        help="The same metric Z-up geometry NPZ used to generate the Neon CSV",
+    )
     args = parser.parse_args()
+    if args.start_n < 0 or args.skip_n < 1 or args.max_n < 0:
+        parser.error("Require start_n >= 0, skip_n >= 1 and max_n >= 0")
 
     input_path, dataset_type, seq_name, log_dir, view_path, load_view_data = (
         load_common(args)
@@ -55,6 +61,18 @@ def main():
     if args.verbose:
         print(f"==> Loading OBBs from {csv_path}")
     timed_obbs = read_obb_csv(csv_path)
+    bb2d_csv_path = resolve_bb2d_csv(log_dir, args.bb2d_csv, args.write_name)
+    if dataset_type == "neon":
+        from utils.neon_viewer import build_neon_context
+
+        try:
+            seq_ctx, timed_obbs = build_neon_context(
+                input_path, args.neon_geometry, log_dir, args.write_name, timed_obbs
+            )
+        except (ValueError, OSError, KeyError) as exc:
+            parser.error(str(exc))
+    else:
+        seq_ctx = build_seq_ctx(input_path, dataset_type)
     timed_obbs = subsample_timed_obbs(
         timed_obbs, skip_n=args.skip_n, start_n=args.start_n, max_n=args.max_n
     )
@@ -62,8 +80,6 @@ def main():
         total_dets = sum(len(obbs) for obbs in timed_obbs.values())
         print(f"==> Loaded {len(timed_obbs)} frames, {total_dets} detections")
 
-    seq_ctx = build_seq_ctx(input_path, dataset_type)
-    bb2d_csv_path = resolve_bb2d_csv(log_dir, args.bb2d_csv, args.write_name)
 
     default_w, default_h = 2250 * scale_factor, 1100 * scale_factor
     init_w = args.window_w if args.window_w > 0 else default_w
@@ -100,7 +116,11 @@ def main():
                 self.is_playing = True
                 self.follow_view = True
 
-    launch_viewer(Viewer)
+    try:
+        launch_viewer(Viewer)
+    finally:
+        if dataset_type == "neon":
+            seq_ctx["loader"].close()
 
 
 if __name__ == "__main__":

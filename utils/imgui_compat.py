@@ -170,9 +170,9 @@ class _DrawListWrapper:
             _imgui.ImVec2(x1, y1),
             _imgui.ImVec2(x2, y2),
             col,
-            rounding,
-            flags,
-            thickness,
+            rounding=rounding,
+            flags=flags,
+            thickness=thickness,
         )
 
     def add_rect_filled(self, x1, y1, x2, y2, col, rounding=0.0, flags=0):

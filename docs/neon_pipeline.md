@@ -141,6 +141,44 @@ python evaluate_neon_geometry.py \
   --output output/neon_run_01/reference_evaluation.json
 ```
 
+## Neonの対話型Viewer
+
+`view_tracker.py` はNeonの歪み補正済み画像、外部カメラ姿勢、任意の点群、
+Boxerの検出CSVを読み込みます。研究室PCのGUIデスクトップ内のターミナルで
+実行してください。OpenGLの表示環境が必要です。
+
+`neon_import_1` の再実行済み結果を開くコマンド:
+
+```bash
+cd /home/ubint-lab/boxer
+source .venv/bin/activate
+python view_tracker.py \
+  --input sample_data/neon_import_1 \
+  --output_dir output/neon_import_1_boxer_20261014_dsu8nekl/boxer_000 \
+  --write_name boxer \
+  --neon_geometry output/neon_import_1_complete/session_000/geometry/geometry_segment_000.npz \
+  --window_w 1600 --window_h 900 \
+  --autoplay
+```
+
+この結果は元動画の231〜347番の117フレームに対応します。`--input`には
+記録ディレクトリ、または記録が1つだけ入った親ディレクトリを指定できます。
+`--output_dir`は記録名ディレクトリの**親**、`--write_name`はCSV名の接頭辞です。
+`--neon_geometry`には必ずそのBoxer実行に使用した同一座標系のNPZを指定します。
+時刻が一致していても、別のSLAM実行のNPZは原点・姿勢が異なる場合があります。
+
+必要なファイルは `<write_name>_3dbbs.csv`、`<write_name>_frames.csv`、
+`<write_name>_input.json`、`owl_2dbbs.csv`（変更時は`--bb2d_csv`）です。
+Viewerは未追跡の検出からオンライン追跡を実行します。保存済みの
+`*_3dbbs_tracked.csv`をそのまま再生する方式ではなく、GUIの追跡設定で結果が変わります。
+
+操作は左の **Play/Pause**、**< / >**、フレームスライダーで行います。
+**Follow View**を解除すると視点を自由に操作できます。
+静的な点群は表示用に読み込み、各フレームで観測された点とはみなしません。
+元フレーム番号と整数ナノ秒時刻を保持し、検出ゼロのフレームも再生します。
+`--start_n`・`--max_n`・`--skip_n`は処理済みフレーム一覧に対して適用されます。
+姿勢欠落や時刻不一致、各フレーム独立の推定結果はエラーにし、補間しません。
+
 ## VS Code Remote SSHから動画を開く
 
 Remote SSHのターミナルは研究室PC上で動作します。

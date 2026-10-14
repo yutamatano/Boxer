@@ -236,8 +236,11 @@ thus loses both measured depth input and point-based visibility evidence.
 
 The optional offline adapter uses **monocular-inertial ORB-SLAM3**. It does not
 change BoxerNet, the tracker, or fusion. Its outputs are continuous camera-pose and optional sparse-map
-segments that the existing `--neon_geometry` option accepts. This does not add
-Neon support to the interactive `view_tracker.py` loader.
+segments that the existing `--neon_geometry` option accepts. The desktop
+`view_tracker.py` also accepts Neon recordings with `--neon_geometry`, using
+the matching `*_input.json` and `*_frames.csv` beside the detection CSV.
+See [Neon viewer instructions](docs/neon_pipeline.md#neonの対話型viewer) for a
+tested command. A local graphical display is required.
 
 The recommended end-to-end entry point is now `run_neon_pipeline.py`.
 It stops a SLAM session at the first loss/reset after metric initialization,
