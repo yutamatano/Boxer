@@ -36,6 +36,7 @@ class NeonLoader(BaseLoader):
         geometry_path=None,
         gaze=False,
         gaze_max_delta_ms=10.,
+        frame_ids=None,
     ):
         if start_n < 0 or skip_n < 1 or (max_n is not None and max_n < 1):
             raise ValueError("Require start_n >= 0, skip_n >= 1 and max_n >= 1")
@@ -102,7 +103,22 @@ class NeonLoader(BaseLoader):
                 raise ValueError("Scene video and .time samples do not match")
             if np.any(np.diff(self.timestamps_ns) <= 0):
                 raise ValueError("Scene timestamps must be strictly increasing")
-            self.frame_indices = np.arange(start_n, len(self.scene), skip_n)[:max_n]
+            if frame_ids is None:
+                self.frame_indices = np.arange(start_n, len(self.scene), skip_n)[:max_n]
+            else:
+                # Explicit source IDs are used by replay; never renumber a segment.
+                ids = np.asarray(frame_ids)
+                if (
+                    ids.ndim != 1 or ids.dtype.kind not in "iu" or not len(ids)
+                    or np.any(ids >= len(self.scene)) or np.any(ids < 0)
+                    or np.any(ids[1:] <= ids[:-1])
+                ):
+                    raise ValueError(
+                        "frame_ids must be increasing source frame IDs in range"
+                    )
+                if start_n != 0 or skip_n != 1 or max_n is not None:
+                    raise ValueError("frame_ids cannot be combined with frame slicing")
+                self.frame_indices = ids.astype(np.int64)
             self.length = len(self.frame_indices)
             if not self.length:
                 raise ValueError("No scene frames selected; check --start_n")

@@ -146,6 +146,55 @@ boxer/bin/python run_boxer.py \
 別のVIO/SLAMマップの点群を混ぜる場合、その点群も同じ実環境座標へ整列する
 必要があります。この変換コマンドは点群や3Dモデルを生成しません。
 
+## 5. Viewerで視線・注視位置を3D表示
+
+`view_tracker.py` は同じ出力先の `boxer_gaze.csv` と
+`boxer_gaze_targets.csv` を自動で読み込みます。右の3D画面に
+**オレンジの視線**と**マゼンタの推定注視点**を表示し、RGBにも対応する位置を重ねます。
+Gaze欄で表示のON/OFF、交点がない場合の視線の表示長を変更できます。
+対象名・推定距離・欠測理由もGaze欄に表示します。
+
+先ほどの点群・軌跡なしの出力を再生する場合：
+
+```bash
+boxer/bin/python view_tracker.py \
+  --input sample_data/2026-10-10_09-39-40-d4fe821f-20261015T025507Z-1-001/2026-10-10_09-39-40-d4fe821f \
+  --output_dir output/neon_gaze --point_cloud off --autoplay
+```
+
+この場合は「Camera-local 3D per frame」と表示されます。各フレームの
+カメラ中心を原点とした物体・視線を表示し、フレームをまたぐ追跡・軌跡表示は
+行いません。物体を部屋全体に配置した再構成ではありません。
+
+SLAM3またはTag Alignerの姿勢を使って推論した出力では、**推論時と同じNPZ**が必要です。
+
+```bash
+boxer/bin/python view_tracker.py \
+  --input sample_data/<記録名> \
+  --output_dir output/neon_aligned_000 \
+  --neon_geometry output/tag_alignment/geometry_segment_000.npz \
+  --point_cloud off --autoplay
+```
+
+`--output_dir` は記録名サブディレクトリの**親**です。
+`boxer_3dbbs.csv`、`boxer_input.json`、`boxer_frames.csv` を同じ場所に保管してください。
+元のフレームID・int64 ns時刻で映像、姿勢、視線を照合します。
+検出0件のフレームも再生し、時刻や座標が不整合なCSVはエラーにします。
+Viewerの `--start_n` / `--skip_n` / `--max_n` はこの処理済みフレーム列に適用します。
+
+視線CSVだけなら線のみ表示します。交点のない線の先端は注視点ではありません。
+欠測時は該当する線・点を消し、前フレームの位置を残しません。
+CSVがない既存の出力では、視線を表示せず通常の物体表示を行います。
+注視点は保存済みの推定値なので、Viewerの物体信頼度フィルタや
+オンラインTrackerの設定を変えても再計算しません。
+軌跡があるモードのTrackerは、保存済み追跡履歴そのものではなく
+`boxer_3dbbs.csv` から再計算します。
+
+点群の `auto/on/off` はViewerでも利用できます。`on` はNPZ内の
+登録済み `points_world` が必須です。視線・注視点の表示自体には点群は不要です。
+画面は3Dボックス・軌跡・線・点の表示であり、部屋の面メッシュは生成しません。
+対話操作にはOpenGL対応のGUIセッションが必要です。
+
 ## CSVと精度上の意味
 
 `boxer_gaze.csv` は**選択した映像フレームごとに1行**です。
@@ -179,13 +228,13 @@ Tag Aligner姿勢の有無と由来は `boxer_input.json` の `alignment` で確
 
 `--skip_viz` は画像出力だけを、`--no_csv` はCSV/メタデータ出力を無効にします。
 `--cache3d` はフレーム読込を省略するため `--neon_gaze` と併用できません。
-現在の表示先は `run_boxer.py` のJPEG/MP4です。
-既存の対話型 `view_tracker.py` はNeon入力に未対応です。
+JPEG/MP4表示に加え、上記の `view_tracker.py` で対話的に3D表示できます。
 
 ## 検証
 
 ```bash
-boxer/bin/python -m pytest -q tests/test_gaze_target.py tests/test_neon_gaze.py tests/test_neon_loader.py \
+boxer/bin/python -m pytest -q tests/test_gaze_viewer.py tests/test_neon_viewer.py \
+  tests/test_gaze_target.py tests/test_neon_gaze.py tests/test_neon_loader.py \
   --basetemp=output/neon_gaze_tests
 ```
 

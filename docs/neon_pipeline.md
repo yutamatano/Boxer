@@ -92,6 +92,15 @@ output/neon_run_01/
 （`--fuse`指定時の静的物体）、`boxer_viz_final.mp4` です。
 追跡と融合は別々の処理として順番に実行します。
 
+## Viewerでの視線・注視点再生
+
+`--gaze_targets` で出力した区間は、`view_tracker.py` に同じ記録、
+区間のBoxer出力先、同じ `--neon_geometry` を指定して再生できます。
+点群がなくても `--point_cloud off` で3Dボックス・視線・推定注視点を表示します。
+`frame_fallback` の出力は姿勢を指定せず、各フレームのカメラ基準で再生します。
+独立したSLAM区間を同じ世界座標として混ぜないでください。
+詳細なコマンドは[Viewerでの3D表示](neon_gaze_alignment.md#5-viewerで視線注視位置を3d表示)を参照してください。
+
 ## 原因調査と残る制約
 
 2026-10-10の `neon_import_1` は618フレーム、約61.74秒、約10 fpsです。

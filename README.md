@@ -200,8 +200,12 @@ The frame table includes frames with zero detections; box CSVs contain detection
 only. `.time` is the primary clock, matching the official reader; `.time_aux` is
 preserved separately (`-1` if absent). Timestamps remain integer nanoseconds.
 To overlay raw gaze later, apply the same undistortion and resize to its pixel
-coordinates. The generated JPEG/MP4 visualization supports Neon; the separate
-interactive `view_*.py` loaders do not yet support Neon recordings.
+coordinates. `view_tracker.py` now replays Neon RGB, 3D boxes, exported gaze rays
+and estimated gaze targets. Use the same `--neon_geometry` as the Boxer run for
+world-coordinate replay, or omit it for independent camera-local frames with
+tracking disabled. Points are optional (`--point_cloud off`). See the
+[interactive gaze viewer commands](docs/neon_gaze_alignment.md#5-viewerで視線注視位置を3d表示).
+`view_fusion.py` does not yet support Neon recordings.
 
 ### External point clouds and camera poses
 
@@ -243,8 +247,8 @@ thus loses both measured depth input and point-based visibility evidence.
 
 The optional offline adapter uses **monocular-inertial ORB-SLAM3**. It does not
 change BoxerNet, the tracker, or fusion. Its outputs are continuous camera-pose and optional sparse-map
-segments that the existing `--neon_geometry` option accepts. This does not add
-Neon support to the interactive `view_tracker.py` loader.
+segments that the existing `--neon_geometry` option accepts. Supply the same NPZ
+to `view_tracker.py` to replay the detections and gaze in that segment's world frame.
 
 The recommended end-to-end entry point is now `run_neon_pipeline.py`.
 It stops a SLAM session at the first loss/reset after metric initialization,

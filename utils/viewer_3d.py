@@ -506,6 +506,8 @@ from utils.video import make_mp4
 
 def build_seq_ctx(input_path, dataset_type):
     """Build viewer context from input path (creates loader for traj/calib/RGB)."""
+    if dataset_type == "neon":
+        raise ValueError("Use view_tracker.py for Neon replay")
     if dataset_type == "aria":
         from loaders.aria_loader import AriaLoader
 
@@ -807,6 +809,11 @@ def resolve_input(input_str):
                 input_path = sample
             elif os.path.exists(legacy):
                 input_path = legacy
+        from utils.neon_viewer import resolve_neon_recording
+
+        recording = resolve_neon_recording(input_path)
+        if recording is not None:
+            return str(recording), "neon", recording.name
         seq_name = input_path.rstrip("/").split("/")[-1]
         return input_path, "aria", seq_name
 
@@ -2984,6 +2991,7 @@ class SequenceOBBViewer(OBBViewer):
                     )
                 self._data_source = seq_ctx_data.get("source", "aria")
                 source_name = {
+                    "neon": "NeonLoader",
                     "ca1m": "CALoader",
                     "scannet": "ScanNetLoader",
                     "omni3d": "OmniLoader",
@@ -3088,6 +3096,8 @@ class SequenceOBBViewer(OBBViewer):
         else:
             idx = int(find_nearest2(self._rgb_timestamps, ts_ns))
             ts_key = int(self._rgb_timestamps[idx])
+        if getattr(self, "_data_source", None) == "neon" and ts_key != int(ts_ns):
+            return None
         if ts_key in self._rgb_lru_cache:
             img = self._rgb_lru_cache[ts_key]
             self._rgb_lru_cache.move_to_end(ts_key)
@@ -3141,7 +3151,8 @@ class SequenceOBBViewer(OBBViewer):
                 if len(self._rgb_lru_cache) > self._rgb_lru_max_items:
                     self._rgb_lru_cache.popitem(last=False)
         elif (
-            getattr(self, "_data_source", None) == "omni3d" and self._loader is not None
+            getattr(self, "_data_source", None) in ("omni3d", "neon")
+            and self._loader is not None
         ):
             datum = self._loader.load(idx)
             img_t = datum["img0"][0].permute(1, 2, 0).cpu().numpy()
@@ -3304,7 +3315,7 @@ class SequenceOBBViewer(OBBViewer):
 
     def _build_trajectory_geometry(self) -> None:
         """Build full trajectory segment array for trajectory tail rendering."""
-        if self.traj is None:
+        if self.traj is None or getattr(self, "_frame_local", False):
             return
         if hasattr(self.traj, "t"):
             positions = self.traj.t.cpu().float()
@@ -3437,6 +3448,11 @@ class SequenceOBBViewer(OBBViewer):
             return None, None
         if len(self.pose_ts) == 0 or len(self.calib_ts) == 0:
             return None, None
+        if getattr(self, "_data_source", None) == "neon":
+            idx = int(np.searchsorted(self.pose_ts, ts_ns))
+            if idx == len(self.pose_ts) or int(self.pose_ts[idx]) != int(ts_ns):
+                return None, None
+            return self.calibs[idx].float(), self.traj[idx].float()
         if getattr(self, "_data_source", None) == "ca1m":
             if len(self._rgb_timestamps) > 0:
                 idx = int(find_nearest2(self._rgb_timestamps, ts_ns))
@@ -3933,6 +3949,13 @@ class TrackerViewer(SequenceOBBViewer):
         """
         self._prebuilt_seq_ctx = seq_ctx
         global _verbose_logging
+        self._frame_local = bool(seq_ctx and seq_ctx.get("frame_local"))
+        self._gaze_frames = (seq_ctx or {}).get("gaze_frames", {})
+        self._gaze_overlay = None
+        self._gaze_state = None
+        self.show_gaze_ray = True
+        self.show_gaze_target = True
+        self.gaze_ray_length = 3.0
         _verbose_logging = verbose
         t_init0 = time_module.perf_counter()
         _startup_log("TrackerViewer init start")
@@ -3990,7 +4013,8 @@ class TrackerViewer(SequenceOBBViewer):
             min_hits=self.tracker_min_hits,
             conf_threshold=self.tracker_conf_threshold,
             force_cpu=self.tracker_force_cpu,
-            merge_iou_threshold=self.tracker_merge_iou,
+            # Local replay never tracks/merges; avoid loading its text model.
+            merge_iou_threshold=0.0 if self._frame_local else self.tracker_merge_iou,
             merge_semantic_threshold=self.tracker_merge_sem,
             merge_iou_2d_threshold=self.tracker_merge_iou_2d,
             merge_interval=self.tracker_merge_interval,
@@ -4058,6 +4082,7 @@ class TrackerViewer(SequenceOBBViewer):
                 )
             self._data_source = seq_ctx.get("source", "aria")
             source_name = {
+                "neon": "NeonLoader",
                 "ca1m": "CALoader",
                 "scannet": "ScanNetLoader",
             }.get(self._data_source, "AriaLoader")
@@ -4083,13 +4108,13 @@ class TrackerViewer(SequenceOBBViewer):
                 )
             else:
                 print(
-                    f"Loaded CA1M with {self._rgb_num_frames} RGB frames from {seq_name}"
+                    f"Loaded {source_name} with {self._rgb_num_frames} RGB frames from {seq_name}"
                 )
             print(
-                f"Loaded trajectory with {len(self.traj) if self.traj is not None else 0} poses via AriaLoader"
+                f"Loaded trajectory with {len(self.traj) if self.traj is not None else 0} poses via {source_name}"
             )
             print(
-                f"Loaded online calibration with {len(self.calibs) if self.calibs is not None else 0} entries via AriaLoader"
+                f"Loaded calibration with {len(self.calibs) if self.calibs is not None else 0} entries via {source_name}"
             )
             # Optional semidense maps from AriaLoader
             self._aria_uid_to_p3 = seq_ctx.get("uid_to_p3", None)
@@ -4108,6 +4133,8 @@ class TrackerViewer(SequenceOBBViewer):
                 f"Tracker sequence context applied in {(time_module.perf_counter() - t_ctx0):.2f}s"
             )
         except Exception as e:
+            if self._prebuilt_seq_ctx and self._prebuilt_seq_ctx.get("source") == "neon":
+                raise
             self._vrs_is_nebula = False
             self._rgb_images = None
             self._loader = None
@@ -4295,6 +4322,11 @@ class TrackerViewer(SequenceOBBViewer):
         self._apply_visual_theme()
 
         # Build trajectory line geometry (needs GL context from super().__init__)
+        if self._data_source == "neon":
+            self.show_raw_set = True
+        if self._frame_local:
+            self.show_trajectory = False
+            self.show_rgb_raw = True
         self.traj_instance_vbo = None
         self.traj_instance_vao = None
         self.traj_instance_count = 0
@@ -4747,7 +4779,10 @@ class TrackerViewer(SequenceOBBViewer):
 
         # Also check nearby timestamps (observations may not align exactly)
         # Use the nearest observation timestamp within 1ms
-        if not observed_uids and len(self._all_obs_timestamps) > 0:
+        if (
+            not observed_uids and len(self._all_obs_timestamps) > 0
+            and getattr(self, "_data_source", None) != "neon"
+        ):
             nearest_idx = find_nearest2(self._all_obs_timestamps, ts_ns)
             nearest_ts = int(self._all_obs_timestamps[nearest_idx])
             if abs(nearest_ts - ts_ns) < 1_000_000:  # within 1ms
@@ -4871,7 +4906,10 @@ class TrackerViewer(SequenceOBBViewer):
         if target_idx >= self.total_frames:
             target_idx = self.total_frames - 1
 
-        if self.freeze_tracker:
+        if self._frame_local:
+            # Independent camera frames cannot be fused or tracked across time.
+            pass
+        elif self.freeze_tracker:
             # Skip tracker updates — just move the frame pointer
             pass
         elif target_idx == self.current_frame_idx + 1:
@@ -4916,11 +4954,20 @@ class TrackerViewer(SequenceOBBViewer):
         ts = self.sorted_timestamps[target_idx]
         rgb = self._load_rgb_for_timestamp(ts)
         if rgb is not None:
+            state = self._gaze_frames.get(ts)
+            if state is not None and state["image_xy"] is not None:
+                # The LRU stores unannotated images; never accumulate old markers.
+                rgb = rgb.copy()
+                pixel = tuple(np.rint(state["image_xy"] * self._rgb_img_scale).astype(int))
+                cv2.circle(rgb, pixel, 9, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.circle(rgb, pixel, 9, (255, 115, 0), 2, cv2.LINE_AA)
+                if state["target"] is not None:
+                    cv2.circle(rgb, pixel, 4, (255, 0, 204), -1, cv2.LINE_AA)
             self._upload_rgb_texture(rgb)
 
     def _reset_tracker(self) -> None:
         """Recreate tracker with current parameters."""
-        if self.freeze_tracker:
+        if self.freeze_tracker or self._frame_local:
             return  # Don't reset when using pre-loaded tracks
         self.tracker = BoundingBox3DTracker(
             iou_threshold=self.tracker_iou_threshold,
@@ -5117,8 +5164,12 @@ class TrackerViewer(SequenceOBBViewer):
         if self._bb2d_data is not None and self._bb2d_timestamps is not None:
             idx = int(find_nearest2(self._bb2d_timestamps, ts))
             nearest_ts = int(self._bb2d_timestamps[idx])
-            # Only use if within 50ms tolerance
-            if abs(nearest_ts - ts) < 50_000_000:
+            # Neon uses the exact source clock; other datasets retain 50ms tolerance.
+            matched = (
+                nearest_ts == ts if self._data_source == "neon"
+                else abs(nearest_ts - ts) < 50_000_000
+            )
+            if matched:
                 entry = self._bb2d_data[nearest_ts]
                 bb2d = entry["bb2d"]  # (N, 4) x1,y1,x2,y2
                 labels = entry["labels"]
@@ -5142,6 +5193,13 @@ class TrackerViewer(SequenceOBBViewer):
 
         # Get camera and pose for frustum rendering
         cam, T_wr = self._get_cam_and_pose(nav_ts)
+        self._gaze_state = self._gaze_frames.get(ts)
+        if self._gaze_frames:
+            if self._gaze_overlay is None:
+                from utils.gaze_viewer import GazeOverlay
+
+                self._gaze_overlay = GazeOverlay(self)
+            self._gaze_overlay.update(self._gaze_state, self.gaze_ray_length)
 
         # Rebuild RGB projection caches for this frame (track mode path).
         self._rgb_projected_lines = []
@@ -5857,6 +5915,11 @@ class TrackerViewer(SequenceOBBViewer):
                 mode=self.ctx.POINTS, vertices=self.obs_point_count
             )
 
+        if self._gaze_overlay is not None:
+            self._gaze_overlay.render(
+                mvp, (w, h), self.show_gaze_ray, self.show_gaze_target
+            )
+
         # Restore full viewport for imgui rendering
         full_w, full_h = self.wnd.size
         self.ctx.viewport = (0, 0, full_w, full_h)
@@ -5975,6 +6038,12 @@ class TrackerViewer(SequenceOBBViewer):
             # Exclude recording time from FPS measurement
             self._fps_last_time += time_module.time() - t0
 
+    def on_close(self) -> None:
+        if self._gaze_overlay is not None:
+            self._gaze_overlay.release()
+            self._gaze_overlay = None
+        super().on_close()
+
     def _start_recording(self) -> None:
         self._record_dir = tempfile.mkdtemp(prefix="viz_tracker_rec_")
         self._record_frame_idx = 0
@@ -6025,6 +6094,26 @@ class TrackerViewer(SequenceOBBViewer):
         )
 
         # === Playback Controls (kept identical to fusion) ===
+        if self._frame_local:
+            imgui.text_wrapped("Camera-local 3D per frame (no world trajectory). Tracking disabled.")
+        elif self._data_source == "neon":
+            imgui.text("World 3D: registered camera trajectory")
+        if self._gaze_frames:
+            self._section_header("Gaze")
+            _, self.show_gaze_ray = imgui.checkbox("Ray (orange)", self.show_gaze_ray)
+            _, self.show_gaze_target = imgui.checkbox("Target (magenta)", self.show_gaze_target)
+            imgui.push_item_width(160)
+            changed, self.gaze_ray_length = imgui.slider_float(
+                "No-hit ray length", self.gaze_ray_length, 0.1, 10.0
+            )
+            imgui.pop_item_width()
+            if changed and self._gaze_overlay is not None:
+                self._gaze_overlay.update(self._gaze_state, self.gaze_ray_length)
+            state = self._gaze_state
+            imgui.text("Gaze: " + (state["status"] if state else "missing row"))
+            if state is not None and state["target"] is not None:
+                imgui.text(f"{state['label']} ~{state['distance_m']:.2f} m")
+            imgui.text_wrapped("Target = saved box-surface estimate.")
         self._section_header("Playback")
         if imgui.button(
             "Play" if not self.is_playing else "Pause", width=90, height=28
@@ -6264,6 +6353,11 @@ class TrackerViewer(SequenceOBBViewer):
             )
             imgui.text(f"FPS: {self._fps_display:.1f}")
             imgui.text(f"Frame: {self.current_frame_idx + 1} / {self.total_frames}")
+            if self._data_source == "neon":
+                ts = self.sorted_timestamps[self.current_frame_idx]
+                idx = int(np.searchsorted(self._rgb_timestamps, ts))
+                source_id = self._loader.frame_indices[idx]
+                imgui.text(f"Source frame: {source_id} | Time ns: {ts}")
             imgui.text(
                 f"Detections: {self._current_detection_count}  Active: {self._active_track_count}  Total: {self._total_track_count}"
             )
@@ -6428,7 +6522,7 @@ class TrackerViewer(SequenceOBBViewer):
                 imgui.set_next_window_position(panel_x, bottom_y, imgui.ALWAYS)
                 imgui.set_next_window_size(panel_w, bottom_h, imgui.ALWAYS)
             imgui.begin(
-                "Tracked 3DBBs",
+                "Per-Frame 3DBBs" if self._frame_local else "Tracked 3DBBs",
                 flags=imgui.WINDOW_NO_RESIZE | imgui.WINDOW_NO_MOVE,
             )
             # Draw image filling the panel (preserve aspect ratio)
