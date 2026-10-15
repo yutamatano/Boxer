@@ -275,7 +275,7 @@ class NeonLoader(BaseLoader):
             )
         return datum
 
-    def write_metadata(self, output_dir, write_name):
+    def write_metadata(self, output_dir, write_name, gaze_targets=False):
         """Preserve the frame/time mapping even for frames with no detections."""
         root = Path(output_dir)
         metadata = {
@@ -302,6 +302,19 @@ class NeonLoader(BaseLoader):
                 "depth": "direction only; no measured fixation point or target identity",
             },
         }
+        if gaze_targets:
+            metadata["gaze_targets"] = {
+                "method": "nearest forward intersection with current predicted OBB surfaces",
+                "coordinate_frame": self.coordinate_frame,
+                "origin": "scene camera centre approximation",
+                "depth": "Boxer-estimated metres; not independently measured",
+                "surface": "bounding box approximation; not a measured object surface",
+                "input_points": "follows point_cloud mode; ray test needs no points",
+                "inside_box": "use exit surface and mark camera_inside_box",
+                "missing": "no intersection gives empty position; no temporal carry-forward",
+                "identity": "time_ns + zero-based detection_index in current 3D detections",
+                "temporal_fixation_detection": False,
+            }
         (root / f"{write_name}_input.json").write_text(
             json.dumps(metadata, indent=2) + "\n"
         )

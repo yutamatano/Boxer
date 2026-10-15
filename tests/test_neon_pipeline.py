@@ -18,12 +18,16 @@ def test_boxer_intervals_have_separate_outputs_and_fusion_stage(tmp_path, monkey
             {"geometry": str(tmp_path / "b.npz"), "start_n": 90, "max_n": 50},
         ],
     }
-    args = SimpleNamespace(labels="chair", force_cpu=True, fuse=True)
+    args = SimpleNamespace(labels="chair", force_cpu=True, fuse=True,
+                           gaze_targets=True, gaze_max_delta_ms=5., point_cloud="off")
     pipeline.run_boxer_segments(summary, tmp_path, args)
     assert len(calls) == 4
     for i, start in enumerate((30, 90)):
         tracking, fusion = calls[2 * i : 2 * i + 2]
         assert "--track" in tracking and "--fuse" not in tracking
+        assert "--gaze_targets" in tracking
+        assert tracking[tracking.index("--gaze_max_delta_ms") + 1] == 5.
+        assert tracking[tracking.index("--point_cloud") + 1] == "off"
         assert tracking[tracking.index("--start_n") + 1] == start
         assert (
             tracking[tracking.index("--output_dir") + 1] == tmp_path / f"boxer_{i:03d}"
@@ -83,11 +87,12 @@ def test_frame_estimates_never_receive_world_poses_or_tracking(tmp_path, monkeyp
         "usable_frames": 2,
     }
     pipeline.run_frame_estimates(
-        summary, tmp_path, SimpleNamespace(labels="chair", force_cpu=False)
+        summary, tmp_path, SimpleNamespace(labels="chair", force_cpu=False, gaze_targets=True)
     )
     assert len(calls) == 2
     for command in calls:
         assert "--neon_geometry" not in command
+        assert "--gaze_targets" in command
         assert "--track" not in command and "--fuse" not in command
         assert command[command.index("--point_cloud") + 1] == "off"
     assert summary["total_estimated_frames"] == 5

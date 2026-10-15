@@ -45,6 +45,15 @@ python run_neon_pipeline.py --input neon_import_1 \
 フレーム範囲・解像度・時刻補正・IMU設定は前処理側の設定が使われます。
 `--labels chair,table,monitor` で対象物体を限定できます。
 
+`--gaze_targets --point_cloud off` を追加すると、点群をBoxerへ入力せず、
+Neon視線と推定3Dボックスの交点から注視位置の候補もCSV・動画へ出力します。
+`--neon_gaze` は視線方向と画像表示のみ、`--gaze_max_delta_ms` は視線の
+時刻許容差（既定10 ms）です。
+`--point_cloud auto/on/off` は有効なSLAM軌跡区間のBoxer入力に適用します。
+軌跡のない `--frame-fallback` 区間は点群なしの独立したフレーム座標です。
+`--point_cloud on` と `--frame-fallback` は併用できません。
+座標と出力列の説明は[視線・注視位置の手順](neon_gaze_alignment.md)を参照してください。
+
 ## 出力と区間の扱い
 
 ```text

@@ -15,6 +15,17 @@ from utils.neon_vio import read_csv, recording_path, write_json
 ROOT = Path(__file__).resolve().parent
 
 
+def gaze_options(args):
+    options = []
+    if getattr(args, "gaze_targets", False):
+        options.append("--gaze_targets")
+    elif getattr(args, "neon_gaze", False):
+        options.append("--neon_gaze")
+    if options:
+        options += ["--gaze_max_delta_ms", getattr(args, "gaze_max_delta_ms", 10.)]
+    return options
+
+
 def run_logged(command, log, env=None, allowed=(0,)):
     print("Running:", " ".join(map(str, command)), flush=True)
     print(f"Log: {log}", flush=True)
@@ -49,7 +60,7 @@ def run_boxer_segments(summary, out, args):
             "--skip_n",
             1,
             "--point_cloud",
-            "auto",
+            getattr(args, "point_cloud", "auto"),
             "--track",
             "--output_dir",
             results,
@@ -58,6 +69,7 @@ def run_boxer_segments(summary, out, args):
         ]
         if args.force_cpu:
             command += ["--force_cpu"]
+        command += gaze_options(args)
         run_logged(command, out / f"boxer_{i:03d}.log")
         if args.fuse:
             run_logged(
@@ -124,6 +136,7 @@ def run_frame_estimates(summary, out, args):
         ]
         if args.force_cpu:
             command += ["--force_cpu"]
+        command += gaze_options(args)
         run_logged(command, out / f"frame_only_{i:03d}.log")
         summary["frame_only_intervals"].append(
             dict(
@@ -173,6 +186,10 @@ def main():
     parser.add_argument("--pace", type=float, default=1.0)
     parser.add_argument("--labels", default="lvisplus")
     parser.add_argument("--force_cpu", action="store_true")
+    parser.add_argument("--point_cloud", choices=["auto", "on", "off"], default="auto")
+    parser.add_argument("--neon_gaze", action="store_true")
+    parser.add_argument("--gaze_targets", action="store_true")
+    parser.add_argument("--gaze_max_delta_ms", type=float, default=10.)
     parser.add_argument("--fuse", action="store_true")
     parser.add_argument(
         "--frame-fallback",
@@ -191,6 +208,8 @@ def main():
         help="Use pipeline.json in an existing output directory",
     )
     args = parser.parse_args()
+    if args.point_cloud == "on" and args.frame_fallback:
+        parser.error("--frame-fallback has no registered points; use --point_cloud auto/off")
     try:
         recording = recording_path(args.input)
         out = Path(args.output).expanduser().resolve()

@@ -5,6 +5,10 @@
 取り込むと、Boxerの3D物体と視線の方向を同じメートル単位・Z-upの
 実環境座標で出力できます。Boxer自身が眼球画像から視線を推定する処理ではありません。
 
+`--gaze_targets` を指定すると、視線とBoxerの3Dボックスの交点から
+**注視位置の候補**まで推定します。点群なし・軌跡なしでもフレームごとに動作します。
+`--gaze_targets` は `--neon_gaze` も有効にします。
+
 ## 1. 手元のNeonで視線表示を確認
 
 リポジトリ直下で、既存のBoxer環境を使用します。
@@ -14,7 +18,7 @@ Neon readerとSciPyが必要です（既存のNeon対応と同じ依存関係で
 boxer/bin/python run_boxer.py \
   --input sample_data/2026-10-10_09-39-40-d4fe821f-20261015T025507Z-1-001/2026-10-10_09-39-40-d4fe821f \
   --start_n 0 --max_n 90 --force_cpu --point_cloud off \
-  --labels chair,table,monitor --neon_gaze \
+  --labels 'chair,table,monitor,laptop,cell phone' --gaze_targets \
   --output_dir output/neon_gaze
 ```
 
@@ -22,6 +26,56 @@ boxer/bin/python run_boxer.py \
 `boxer_gaze.csv`、座標系と処理条件を記録した `boxer_input.json` が保存されます。
 姿勢を指定しない場合、CSVは画像座標とカメラ座標の視線方向までを保存します。
 この場合の世界座標欄は空欄です。
+
+### 点群なしで注視位置を推定する
+
+上記コマンドでは、追加で `boxer_gaze_targets.csv` を保存します。
+視線方向と、そのフレームで検出した3Dボックスの表面との交点を計算し、
+手前から最初の交点を注視位置の候補にします。
+動画には対象名と推定距離を表示し、対象ボックスを緑色で強調します。
+対象として検出する物体を `--labels` に含めてください。
+
+| 列 | 意味 |
+| --- | --- |
+| `frame_id`, `time_ns`, `gaze_time_ns`, `gaze_delta_ns` | 映像・視線の元の時刻と対応 |
+| `status` | `estimated` の場合のみ位置を採用。欠測の理由も保存 |
+| `method` | `predicted_obb_surface`（推定ボックス表面との交点） |
+| `coordinate_frame` | `position_frame_*` と物体CSVが使う座標系 |
+| `point_cloud_used` | このフレームのBoxer入力に点群を使ったか |
+| `box_count`, `intersection_count` | 検出ボックス数と視線が交差したボックス数 |
+| `detection_index`, `label`, `box_confidence` | 現在の検出の添字、対象名、物体の信頼度 |
+| `camera_inside_box` | カメラがボックス内ならtrue。前方の出口との交点を採用 |
+| `distance_m` | カメラ中心から交点までの推定距離 |
+| `position_camera_x/y/z` | カメラ座標（右・下・前）での推定位置 |
+| `position_frame_x/y/z` | 同じ時刻の物体CSVと同じ座標系での推定位置 |
+
+軌跡がない場合の `coordinate_frame` は `per_frame_assumed_upright` です。
+各フレームの原点はカメラ中心であり、フレーム間の位置比較には使えません。
+SLAM3由来の有効な軌跡NPZを `--neon_geometry` に指定すると
+`world_z_up` となり、そのSLAM区間の座標系で出力します。
+同じ仕組みでTag Alignerの整列済み軌跡も利用できます。
+
+視線がない・画像外・物体がない・交点がない場合は位置欄を空欄にします。
+それぞれ `missing_gaze` / `invalid_gaze` / `outside_scene` / `outside_image` /
+`no_boxes` / `no_intersection` を記録し、前フレームの位置で埋めません。
+`detection_index` は同じ `time_ns` の3D検出CSVの0始まりの行番号です。
+Track IDや、時間的に安定した物体IDではありません。
+
+点群切り替えは従来どおりです。
+
+- `--point_cloud off`：点群を入力せず、Boxerが予測した奥行き・サイズを使用。
+- `--point_cloud auto`：登録済みの点群があればBoxerの入力に使用。
+- `--point_cloud on`：登録済み点群が必須。欠測はエラー。
+
+交点計算自体はどのモードでも3Dボックスを使います。
+将来LiDARを使う場合も、この実装ではLiDAR点に直接当てる処理は行いません。
+カメラ姿勢と同じ座標系へ整列した点群を、既存の `points_world` として
+入力すると、点群を使ったBoxerの推定結果から交点を求めます。
+
+点群なしの奥行きとサイズは学習モデルの推定値で、交点はボックス表面の
+近似です。実測した物体表面の位置や絶対距離の精度は保証されません。
+また、時間的な固視・サッカードの分類は行いません。
+`box_confidence` は物体検出の信頼度で、注視判定の確率ではありません。
 
 ## 2. 実環境へ整列するための入力
 
@@ -82,7 +136,7 @@ boxer/bin/python run_boxer.py \
   --input sample_data/<記録名> \
   --neon_geometry output/tag_alignment/geometry_segment_000.npz \
   --start_n START --max_n COUNT --skip_n 1 \
-  --neon_gaze --point_cloud off --track --force_cpu \
+  --gaze_targets --point_cloud off --track --force_cpu \
   --labels chair,table,monitor \
   --output_dir output/neon_aligned_000
 ```
@@ -116,7 +170,8 @@ boxer/bin/python run_boxer.py \
 
 `origin_world + distance * direction_world` は視線方向に沿った光線です。
 原点は**シーンカメラ中心で近似**しており、眼球中心ではありません。
-実測の注視深度、物体との交点、注視対象IDはこのCSVからは確定しません。
+視線CSV単体には注視深度や対象名を含めません。
+`--gaze_targets` を指定した場合の交点・対象候補は別のCSVに保存します。
 近距離の視差、視線・姿勢の誤差、フレーム内の時間差が残ります。
 `world_ray` は座標変換ができたという意味であり、絶対位置精度を保証しません。
 Tag Aligner姿勢の有無と由来は `boxer_input.json` の `alignment` で確認できます。
@@ -130,7 +185,7 @@ Tag Aligner姿勢の有無と由来は `boxer_input.json` の `alignment` で確
 ## 検証
 
 ```bash
-boxer/bin/python -m pytest -q tests/test_neon_gaze.py tests/test_neon_loader.py \
+boxer/bin/python -m pytest -q tests/test_gaze_target.py tests/test_neon_gaze.py tests/test_neon_loader.py \
   --basetemp=output/neon_gaze_tests
 ```
 
@@ -143,3 +198,11 @@ boxer/bin/python -m pytest -q tests/test_neon_gaze.py tests/test_neon_loader.py 
 同じ記録のフレーム10～12をCPU・点群なし・`chair,table,monitor` で比較し、
 視線オプションの有無で2D検出CSV（14件）と3D検出CSV（13件）が
 バイト単位で一致しました。位置精度や処理速度の改善を示す比較ではありません。
+
+同じフレーム10～12に `laptop,cell phone` も含む5種類のラベルを指定した
+点群なしの実行では、3フレームとも交点を得ました。
+対象候補は `cell phone`, `cell phone`, `laptop`、推定距離はそれぞれ
+約0.491 m、0.653 m、0.587 mでした。実測値との比較は未実施です。
+この5ラベルの条件でも、注視推定を有効にした場合と無効にした場合で、
+2D検出24件・3D検出23件・視線3行のCSVがバイト単位で一致しました。
+全体テストは404件成功、任意依存関係のない6件をスキップしました。

@@ -6,6 +6,7 @@
 
 # pyre-unsafe
 import argparse
+from collections import Counter
 import os
 import re
 import time
@@ -30,6 +31,7 @@ from utils.demo_utils import (
 )
 from utils.file_io import ObbCsvWriter2, load_bb2d_csv, read_obb_csv, save_bb2d_csv
 from utils.image import draw_bb3s, put_text, render_bb2, render_depth_patches, torch2cv2
+from utils.gaze_target import GazeTargetCsvWriter, draw_gaze_target, estimate_gaze_target
 from utils.neon_gaze import GazeCsvWriter, draw_gaze
 from utils.taxonomy import load_text_labels
 from utils.tw.tensor_utils import (
@@ -112,6 +114,7 @@ def main():
     points.add_argument("--no_sdp", dest="point_cloud", action="store_const", const="off", help="alias for --point_cloud off")
     parser.add_argument("--neon_geometry", type=str, help="Neon NPZ: timestamps_ns, T_world_camera, optional points_world (see README)")
     parser.add_argument("--neon_gaze", action="store_true", help="Export frame-sampled Neon gaze and overlay it on output images")
+    parser.add_argument("--gaze_targets", action="store_true", help="Estimate gaze positions on current 3D box surfaces; enables --neon_gaze")
     parser.add_argument("--gaze_max_delta_ms", type=float, default=10., help="Maximum gaze-to-frame time difference in ms (default: 10)")
     parser.add_argument("--no_csv", action="store_true", help="skip CSV writing")
     parser.add_argument("--force_cpu", action="store_true", help="force CPU")
@@ -122,6 +125,8 @@ def main():
     parser.add_argument("--force_precision", type=str, default=None, choices=["float32", "bfloat16"], help="Override auto-detected inference precision")
     parser.add_argument("--output_dir", type=str, default=EVAL_PATH, help="Output directory for results (default: output/)")
     args = parser.parse_args()
+    if args.gaze_targets:
+        args.neon_gaze = True
 
     if args.fuse and args.track:
         parser.error("--fuse and --track are mutually exclusive")
@@ -350,7 +355,7 @@ def main():
     loader._init_prefetch()
     print(f"==> Will resize images to {loader.resize}x{loader.resize} for boxernet")
     if dataset_type == "neon" and not args.no_csv:
-        loader.write_metadata(log_dir, args.write_name)
+        loader.write_metadata(log_dir, args.write_name, gaze_targets=args.gaze_targets)
     _dbg("boxernet")
 
     # Print model architecture
@@ -396,6 +401,23 @@ def main():
         GazeCsvWriter(os.path.join(log_dir, f"{args.write_name}_gaze.csv"))
         if args.neon_gaze and not args.no_csv else None
     )
+    target_path = os.path.join(log_dir, f"{args.write_name}_gaze_targets.csv")
+    target_writer = (
+        GazeTargetCsvWriter(target_path) if args.gaze_targets and not args.no_csv else None
+    )
+    target_counts = Counter()
+
+    def save_gaze_target(datum, obbs=None):
+        if not args.gaze_targets:
+            return None
+        target = estimate_gaze_target(
+            datum["gaze"], obbs, datum["T_world_rig0"].matrix.cpu().numpy(),
+            loader.coordinate_frame, point_cloud_used=bool(datum["sdp_w"].numel()),
+        )
+        target_counts[target["status"]] += 1
+        if target_writer is not None:
+            target_writer.write(target)
+        return target
 
     tracker = None
     if args.track:
@@ -411,8 +433,9 @@ def main():
             verbose=False,
         )
 
-    def write_empty_frame(img_np, HH, WW, ii, gaze):
+    def write_empty_frame(img_np, HH, WW, ii, gaze, target=None):
         img_np = draw_gaze(img_np.copy(), gaze)
+        draw_gaze_target(img_np, gaze, target)
         panels = [img_np, img_np]
         if args.track:
             panels.append(img_np)
@@ -508,12 +531,13 @@ def main():
             # Check if there are any valid GT objects for this frame
             obbs_valid = datum["obbs"].remove_padding()
             if len(obbs_valid) == 0:
+                target = save_gaze_target(datum)
                 t_owl = timer.stop("owl")
                 pbar.set_postfix_str(
                     f"0 GT obbs | load:{t_load:.0f}ms owl:{t_owl:.0f}ms"
                 )
                 if args.viz_headless:
-                    write_empty_frame(img_np, HH, WW, ii, datum.get("gaze"))
+                    write_empty_frame(img_np, HH, WW, ii, datum.get("gaze"), target)
 
                 continue
 
@@ -530,12 +554,13 @@ def main():
             bb2d = bb2d[valid_mask]
             labels2d = [labels2d[i] for i in range(len(valid_mask)) if valid_mask[i]]
             if len(bb2d) == 0:
+                target = save_gaze_target(datum)
                 t_owl = timer.stop("owl")
                 pbar.set_postfix_str(
                     f"0 valid bb2d | load:{t_load:.0f}ms owl:{t_owl:.0f}ms"
                 )
                 if args.viz_headless:
-                    write_empty_frame(img_np, HH, WW, ii, datum.get("gaze"))
+                    write_empty_frame(img_np, HH, WW, ii, datum.get("gaze"), target)
                 continue
 
             scores2d = 0.5 * torch.ones(bb2d.shape[0])
@@ -550,9 +575,10 @@ def main():
         t_owl = timer.stop("owl")
 
         if bb2d.shape[0] == 0:
+            target = save_gaze_target(datum)
             pbar.set_postfix_str(f"0 dets | load:{t_load:.0f}ms owl:{t_owl:.0f}ms")
             if args.viz_headless:
-                write_empty_frame(img_np, HH, WW, ii, datum.get("gaze"))
+                write_empty_frame(img_np, HH, WW, ii, datum.get("gaze"), target)
             continue
 
         # 3D BoxerNet
@@ -611,6 +637,7 @@ def main():
 
         # Visualization (includes writing CSV and images)
         timer.start("csv")
+        target = save_gaze_target(datum, obb_pr_w)
         time_ns = int(datum["time_ns0"])
         if writer is not None:
             writer.write(obb_pr_w, time_ns, sem_id_to_name=sem_id_to_name)
@@ -664,6 +691,10 @@ def main():
             bb2_colors = jet_colors_bgr(scores2d)
             bb3_texts = [f"{l[:10]} {s:.2f}" for s, l in zip(scores3d, labels3d)]
             bb3_colors = jet_colors_bgr(scores3d)
+            if target is not None and target["status"] == "estimated":
+                target_index = target["detection_index"]
+                bb3_colors[target_index] = (0, 255, 0)
+                bb3_texts[target_index] = "[gaze] " + bb3_texts[target_index]
 
             if DEBUG_VIZ:
                 _t1 = time.perf_counter()
@@ -809,6 +840,7 @@ def main():
 
             for panel in panels:
                 draw_gaze(panel, datum.get("gaze"))
+                draw_gaze_target(panel, datum.get("gaze"), target)
             final = np.hstack(panels)
 
             if DEBUG_VIZ:
@@ -843,6 +875,11 @@ def main():
         loader.close()
     if gaze_writer is not None:
         gaze_writer.close()
+    if target_writer is not None:
+        target_writer.close()
+        print(f"==> Saved estimated gaze targets to {target_path}")
+    if args.gaze_targets:
+        print(f"==> Gaze target results: {dict(target_counts)}")
     if writer is not None:
         writer.close()
         print(f"==> Saved 3D BBs to {csv_path}")

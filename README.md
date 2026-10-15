@@ -155,6 +155,9 @@ python view_prompt.py --input scene0707_00
 For Neon gaze overlays, gaze CSV output and importing Tag Aligner's real-world
 camera poses, see [Neon gaze / Tag Aligner integration](docs/neon_gaze_alignment.md).
 Enable `--neon_gaze` to export gaze; world rays require registered camera poses.
+Use `--gaze_targets --point_cloud off` to estimate a gaze position on predicted
+3D box surfaces without points. Without a trajectory, positions are per-frame
+camera/local estimates; with poses, they also use the registered world frame.
 
 Install the optional official native-recording reader in the Boxer environment:
 
@@ -465,6 +468,7 @@ Results are written to `output/<sequence_name>/`:
 | `--no_sdp` | off | Alias for `--point_cloud off` |
 | `--neon_geometry` | none | Registered external Neon pose/point NPZ (schema above) |
 | `--neon_gaze` | false | Export frame-sampled Neon gaze CSV and overlay gaze in JPEG/MP4 |
+| `--gaze_targets` | false | Estimate nearest gaze/3D-box surface intersection, export target CSV; enables Neon gaze |
 | `--gaze_max_delta_ms` | 10 | Maximum absolute gaze-to-frame time difference in milliseconds |
 | `--force_cpu` | off | Force CPU inference |
 
