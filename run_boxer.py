@@ -30,6 +30,7 @@ from utils.demo_utils import (
 )
 from utils.file_io import ObbCsvWriter2, load_bb2d_csv, read_obb_csv, save_bb2d_csv
 from utils.image import draw_bb3s, put_text, render_bb2, render_depth_patches, torch2cv2
+from utils.neon_gaze import GazeCsvWriter, draw_gaze
 from utils.taxonomy import load_text_labels
 from utils.tw.tensor_utils import (
     pad_string,
@@ -110,6 +111,8 @@ def main():
     points.add_argument("--point_cloud", choices=["auto", "on", "off"], default="auto", help="point input: auto uses available points, on requires them, off uses missing-depth inputs")
     points.add_argument("--no_sdp", dest="point_cloud", action="store_const", const="off", help="alias for --point_cloud off")
     parser.add_argument("--neon_geometry", type=str, help="Neon NPZ: timestamps_ns, T_world_camera, optional points_world (see README)")
+    parser.add_argument("--neon_gaze", action="store_true", help="Export frame-sampled Neon gaze and overlay it on output images")
+    parser.add_argument("--gaze_max_delta_ms", type=float, default=10., help="Maximum gaze-to-frame time difference in ms (default: 10)")
     parser.add_argument("--no_csv", action="store_true", help="skip CSV writing")
     parser.add_argument("--force_cpu", action="store_true", help="force CPU")
     parser.add_argument("--gt2d", action="store_true", help="use GT pseudo 2DBB as input")
@@ -170,6 +173,10 @@ def main():
 
     if args.neon_geometry and dataset_type != "neon":
         parser.error("--neon_geometry is only supported for Neon recordings")
+    if args.neon_gaze and dataset_type != "neon":
+        parser.error("--neon_gaze is only supported for Neon recordings")
+    if args.neon_gaze and args.cache3d:
+        parser.error("--neon_gaze requires frame processing; omit --cache3d")
     if dataset_type == "neon":
         if args.camera != "rgb" or args.gt2d:
             parser.error("Neon uses the scene camera and has no --gt2d annotations")
@@ -232,6 +239,7 @@ def main():
                 remote_root, start_n=args.start_n, skip_n=args.skip_n,
                 max_n=args.max_n, point_cloud=args.point_cloud,
                 geometry_path=args.neon_geometry,
+                gaze=args.neon_gaze, gaze_max_delta_ms=args.gaze_max_delta_ms,
             )
         except (ValueError, ImportError, OSError) as exc:
             parser.error(str(exc))
@@ -384,6 +392,10 @@ def main():
         sem_id_to_name = {v: k for k, v in sem_name_to_id.items()}
 
     writer = None if args.no_csv else ObbCsvWriter2(csv_path)
+    gaze_writer = (
+        GazeCsvWriter(os.path.join(log_dir, f"{args.write_name}_gaze.csv"))
+        if args.neon_gaze and not args.no_csv else None
+    )
 
     tracker = None
     if args.track:
@@ -399,7 +411,8 @@ def main():
             verbose=False,
         )
 
-    def write_empty_frame(img_np, HH, WW, ii):
+    def write_empty_frame(img_np, HH, WW, ii, gaze):
+        img_np = draw_gaze(img_np.copy(), gaze)
         panels = [img_np, img_np]
         if args.track:
             panels.append(img_np)
@@ -444,6 +457,9 @@ def main():
         img_torch = datum["img0"]
         HH, WW = img_torch.shape[2], img_torch.shape[3]
         img_np = torch2cv2(img_torch, ensure_rgb=True)
+        # Write before detection: even frames with no objects retain gaze/missing rows.
+        if gaze_writer is not None:
+            gaze_writer.write(datum["gaze"])
         t_load = timer.stop("load")
 
         if DEBUG_VIZ:
@@ -497,7 +513,7 @@ def main():
                     f"0 GT obbs | load:{t_load:.0f}ms owl:{t_owl:.0f}ms"
                 )
                 if args.viz_headless:
-                    write_empty_frame(img_np, HH, WW, ii)
+                    write_empty_frame(img_np, HH, WW, ii, datum.get("gaze"))
 
                 continue
 
@@ -519,7 +535,7 @@ def main():
                     f"0 valid bb2d | load:{t_load:.0f}ms owl:{t_owl:.0f}ms"
                 )
                 if args.viz_headless:
-                    write_empty_frame(img_np, HH, WW, ii)
+                    write_empty_frame(img_np, HH, WW, ii, datum.get("gaze"))
                 continue
 
             scores2d = 0.5 * torch.ones(bb2d.shape[0])
@@ -536,7 +552,7 @@ def main():
         if bb2d.shape[0] == 0:
             pbar.set_postfix_str(f"0 dets | load:{t_load:.0f}ms owl:{t_owl:.0f}ms")
             if args.viz_headless:
-                write_empty_frame(img_np, HH, WW, ii)
+                write_empty_frame(img_np, HH, WW, ii, datum.get("gaze"))
             continue
 
         # 3D BoxerNet
@@ -791,6 +807,8 @@ def main():
                 )
                 panels.append(viz_track)
 
+            for panel in panels:
+                draw_gaze(panel, datum.get("gaze"))
             final = np.hstack(panels)
 
             if DEBUG_VIZ:
@@ -823,6 +841,8 @@ def main():
 
     if dataset_type == "neon":
         loader.close()
+    if gaze_writer is not None:
+        gaze_writer.close()
     if writer is not None:
         writer.close()
         print(f"==> Saved 3D BBs to {csv_path}")

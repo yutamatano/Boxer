@@ -34,6 +34,8 @@ class NeonLoader(BaseLoader):
         resize=None,
         point_cloud="auto",
         geometry_path=None,
+        gaze=False,
+        gaze_max_delta_ms=10.,
     ):
         if start_n < 0 or skip_n < 1 or (max_n is not None and max_n < 1):
             raise ValueError("Require start_n >= 0, skip_n >= 1 and max_n >= 1")
@@ -108,6 +110,7 @@ class NeonLoader(BaseLoader):
             self.poses = None
             self.points = None
             self.geometry_indices = None
+            self.alignment_metadata = None
             if geometry_path is not None:
                 self._load_geometry(geometry_path, load_points=point_cloud != "off")
             self.has_world_poses = self.poses is not None
@@ -120,6 +123,15 @@ class NeonLoader(BaseLoader):
             self.coordinate_frame = (
                 "world_z_up" if self.has_world_poses else "per_frame_assumed_upright"
             )
+            self.gaze = None
+            if gaze:
+                from utils.neon_gaze import NeonGaze
+
+                try:
+                    raw_gaze = self.recording.gaze
+                except (AttributeError, nr.NeonRecording.SensorError) as exc:
+                    raise ValueError("--neon_gaze requires native Neon gaze data") from exc
+                self.gaze = NeonGaze(raw_gaze.time, raw_gaze.point, gaze_max_delta_ms)
         except Exception:
             self.recording.close()
             raise
@@ -177,6 +189,10 @@ class NeonLoader(BaseLoader):
                 )
             self.poses = poses.astype(np.float32)
             self.geometry_indices = indices
+            if "alignment_metadata" in data:
+                self.alignment_metadata = json.loads(str(data["alignment_metadata"].item()))
+                if not isinstance(self.alignment_metadata, dict):
+                    raise ValueError("alignment_metadata must be a JSON object")
             if load_points and "points_world" in data:
                 points = np.asarray(data["points_world"], dtype=np.float32)
                 if (
@@ -212,6 +228,7 @@ class NeonLoader(BaseLoader):
             K_out[1, 1] *= sy
             K_out[0, 2] = (K_out[0, 2] + 0.5) * sx - 0.5
             K_out[1, 2] = (K_out[1, 2] + 0.5) * sy - 0.5
+            self._K_out = K_out
             self._maps = cv2.initUndistortRectifyMap(
                 self.K, self.distortion, None, K_out, (out_w, out_h), cv2.CV_32FC1
             )
@@ -240,7 +257,7 @@ class NeonLoader(BaseLoader):
             # A static map is not evidence that these points were observed now.
             if per_frame and len(points):
                 observed_points = points
-        return {
+        datum = {
             "img0": self.img_to_tensor(image),
             "cam0": self._cam,
             "T_world_rig0": pose,
@@ -250,6 +267,13 @@ class NeonLoader(BaseLoader):
             "frame_id": frame_index,
             "orig_size0": (width, height),
         }
+        if self.gaze is not None:
+            datum["gaze"] = self.gaze.sample(
+                frame_index, datum["time_ns0"], self.K, self.distortion, self._K_out,
+                (width, height), (out_w, out_h),
+                self.poses[geometry_index] if self.has_world_poses else None,
+            )
+        return datum
 
     def write_metadata(self, output_dir, write_name):
         """Preserve the frame/time mapping even for frames with no detections."""
@@ -262,11 +286,21 @@ class NeonLoader(BaseLoader):
                 "external_metric_points" if self.use_points else "missing (-1)"
             ),
             "timestamp_source": "Neon Scene Camera v1 ps*.time (int64 ns)",
-            "images": "undistorted pinhole, resized; raw gaze needs the same transform",
+            "images": "undistorted pinhole, resized; exported gaze uses the same transform",
             "image_size": self.resize,
             "scene_camera_matrix": self.K.tolist(),
             "scene_distortion_coefficients": self.distortion.tolist(),
             "has_world_poses": self.has_world_poses,
+            "alignment": self.alignment_metadata,
+            "gaze": None if self.gaze is None else {
+                "sampling": "one nearest native binocular gaze sample per selected frame",
+                "max_delta_ns": self.gaze.max_delta_ns,
+                "pixels": "same undistortion and pixel-centre resize as scene image",
+                "ray_origin": "scene camera centre (approximation, not eyeball centre)",
+                "world_frame": "world_z_up" if self.has_world_poses else None,
+                "world_pose_time": "scene frame time; signed gaze_delta_ns in CSV",
+                "depth": "direction only; no measured fixation point or target identity",
+            },
         }
         (root / f"{write_name}_input.json").write_text(
             json.dumps(metadata, indent=2) + "\n"

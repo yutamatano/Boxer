@@ -54,6 +54,67 @@ def make_geometry(path, times, points=None):
     return data
 
 
+def test_native_gaze_and_aligned_geometry_share_world(recording, tmp_path):
+    from convert_tag_aligner import convert
+    from test_neon_gaze import write_poses
+
+    root, times = recording
+    (root / "info.json").write_text(json.dumps({
+        "data_format_version": "2.6", "start_time": int(times[0]),
+    }))
+    np.tile(np.array([[32, 24]], dtype="<f4"), (5, 1)).tofile(root / "gaze ps1.raw")
+    (times + 1).tofile(root / "gaze ps1.time")
+    path = tmp_path / "aligned_poses.csv"
+    write_poses(path, [(0, 0.15), (0.3, 0.45)])
+    output = tmp_path / "aligned"
+    report = convert(root, path, output, 0.001)
+    assert report["aligned_frames"] == 4 and report["missing_frames"] == 1
+    assert [(s["start_n"], s["max_n"]) for s in report["segments"]] == [(0, 2), (3, 2)]
+    for segment in report["segments"]:
+        loader = NeonLoader(root, start_n=segment["start_n"], max_n=segment["max_n"],
+                            resize=32, geometry_path=output / segment["geometry"], gaze=True)
+        try:
+            frames = list(loader)
+            for datum in frames:
+                row = datum["gaze"]
+                assert row["gaze_delta_ns"] == 1
+                assert row["status"] == "world_ray"
+                np.testing.assert_allclose([row[f"origin_world_{a}"] for a in "xyz"], [1, 3, -2])
+                np.testing.assert_allclose([row[f"direction_world_{a}"] for a in "xyz"], [0, 1, 0])
+                assert row["image_x"] == pytest.approx(15.75)
+                assert row["image_y"] == pytest.approx((24.5) * 32 / 48 - 0.5)
+                assert datum["time_ns0"] == times[datum["frame_id"]]
+            loader.write_metadata(tmp_path, "aligned_test")
+            meta = json.loads((tmp_path / "aligned_test_input.json").read_text())
+            assert meta["alignment"]["source"] == "tag_aligner"
+            assert meta["gaze"]["world_frame"] == "world_z_up"
+        finally:
+            loader.close()
+    with pytest.raises(ValueError, match="exact .time"):
+        NeonLoader(root, geometry_path=output / report["segments"][0]["geometry"])
+    with pytest.raises(ValueError, match="empty"):
+        convert(root, path, output, 0.001)
+
+
+def test_gaze_without_geometry_does_not_export_assumed_world(recording):
+    root, times = recording
+    np.tile(np.array([[32, 24]], dtype="<f4"), (5, 1)).tofile(root / "gaze ps1.raw")
+    times.tofile(root / "gaze ps1.time")
+    loader = NeonLoader(root, gaze=True, max_n=1)
+    try:
+        row = next(loader)["gaze"]
+        assert row["status"] == "camera_only"
+        assert row["origin_world_x"] == ""
+    finally:
+        loader.close()
+
+
+def test_missing_native_gaze_fails_when_requested(recording):
+    root, _ = recording
+    with pytest.raises(ValueError, match="native Neon gaze"):
+        NeonLoader(root, gaze=True)
+
+
 def test_native_frames_resize_color_and_exact_timestamps(recording, tmp_path):
     root, times = recording
     loader = NeonLoader(root, start_n=1, skip_n=2, max_n=2, resize=32)
