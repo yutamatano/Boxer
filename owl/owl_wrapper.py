@@ -277,8 +277,10 @@ class OwlWrapper(nn.Module):
             else:
                 # Old format: raw tensor
                 self.text_embeddings = cached
-            if self.use_bfloat16:
-                self.text_embeddings = self.text_embeddings.to(dtype=torch.bfloat16)
+            # Caches are shared across devices and precision settings.
+            self.text_embeddings = self.text_embeddings.to(
+                dtype=next(self.vision_detector.parameters()).dtype
+            )
             _dbg(f"load cached text embeddings ({len(text_prompts)} prompts)")
         else:
             self.text_embeddings = self._encode_text(text_prompts)
