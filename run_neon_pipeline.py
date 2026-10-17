@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Prepare Neon, preserve metric SLAM intervals, and run Boxer per interval."""
+"""Prepare Neon, estimate trajectories, infer all frames, and assemble replay."""
 
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
 
 from convert_neon_trajectory import convert
 from evaluate_neon_geometry import evaluate
+from utils.neon_pipeline_viewer import assemble_replay, selected_frame_ids
 from utils.neon_vio import read_csv, recording_path, write_json
 
 ROOT = Path(__file__).resolve().parent
@@ -69,6 +71,8 @@ def run_boxer_segments(summary, out, args):
         ]
         if args.force_cpu:
             command += ["--force_cpu"]
+        if getattr(args, "skip_viz", False):
+            command += ["--skip_viz"]
         command += gaze_options(args)
         run_logged(command, out / f"boxer_{i:03d}.log")
         if args.fuse:
@@ -109,9 +113,8 @@ def uncovered_intervals(frame_ids, segments):
 
 def run_frame_estimates(summary, out, args):
     recording = Path(summary["recording"])
-    frames = read_csv(Path(summary["prepared"]) / "frames.csv")
     intervals = uncovered_intervals(
-        [row["frame_id"] for row in frames], summary["segments"]
+        selected_frame_ids(summary["prepared"]), summary["segments"]
     )
     summary["frame_only_intervals"] = []
     for i, interval in enumerate(intervals):
@@ -136,6 +139,8 @@ def run_frame_estimates(summary, out, args):
         ]
         if args.force_cpu:
             command += ["--force_cpu"]
+        if getattr(args, "skip_viz", False):
+            command += ["--skip_viz"]
         command += gaze_options(args)
         run_logged(command, out / f"frame_only_{i:03d}.log")
         summary["frame_only_intervals"].append(
@@ -163,6 +168,17 @@ def evaluate_segments(summary, out, reference=None):
     write_json(out / "pipeline.json", summary)
 
 
+def run_inference(summary, out, args):
+    run_boxer_segments(summary, out, args)
+    run_frame_estimates(summary, out, args)
+    viewer_output = assemble_replay(summary, out)
+    command = [sys.executable, str(ROOT / "view_tracker.py"), "--input",
+               summary["recording"], "--output_dir", str(viewer_output), "--autoplay"]
+    summary["viewer_command"] = command
+    write_json(out / "pipeline.json", summary)
+    print("Viewer:", shlex.join(command), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True)
@@ -186,6 +202,8 @@ def main():
     parser.add_argument("--pace", type=float, default=1.0)
     parser.add_argument("--labels", default="lvisplus")
     parser.add_argument("--force_cpu", action="store_true")
+    parser.add_argument("--skip_viz", action="store_true",
+                        help="Skip inference JPEG/MP4 output; Viewer CSVs are still saved")
     parser.add_argument("--point_cloud", choices=["auto", "on", "off"], default="auto")
     parser.add_argument("--neon_gaze", action="store_true")
     parser.add_argument("--gaze_targets", action="store_true")
@@ -194,7 +212,7 @@ def main():
     parser.add_argument(
         "--frame-fallback",
         action="store_true",
-        help="Process untracked frames as independent local 3D estimates",
+        help="Compatibility option: untracked frames are now always processed",
     )
     parser.add_argument(
         "--reference",
@@ -208,21 +226,15 @@ def main():
         help="Use pipeline.json in an existing output directory",
     )
     args = parser.parse_args()
-    if args.point_cloud == "on" and args.frame_fallback:
-        parser.error("--frame-fallback has no registered points; use --point_cloud auto/off")
     try:
         recording = recording_path(args.input)
         out = Path(args.output).expanduser().resolve()
         if args.boxer_only:
             summary = json.loads((out / "pipeline.json").read_text())
-            if Path(summary["recording"]).resolve() != recording or (
-                not summary["segments"] and not args.frame_fallback
-            ):
+            if Path(summary["recording"]).resolve() != recording:
                 raise ValueError("Existing pipeline has no matching usable recording")
-            run_boxer_segments(summary, out, args)
             evaluate_segments(summary, out, args.reference)
-            if args.frame_fallback:
-                run_frame_estimates(summary, out, args)
+            run_inference(summary, out, args)
             print(f"Results: {out}")
             return
         if out.exists() and any(out.iterdir()):
@@ -289,7 +301,8 @@ def main():
         summary = {
             "recording": str(recording),
             "prepared": str(prepared),
-            "input_frames": len(frames),
+            "input_frames": len(selected_frame_ids(prepared)),
+            "prepared_frames": len(frames),
             "sessions": [],
             "segments": [],
             "imu_offset_ms_applied": manifest["imu_offset_ms_applied"],
@@ -357,23 +370,18 @@ def main():
             write_json(out / "pipeline.json", summary)
             start_index = next_index
         summary["usable_frames"] = sum(s["max_n"] for s in summary["segments"])
-        summary["coverage"] = summary["usable_frames"] / len(frames)
+        summary["coverage"] = summary["usable_frames"] / summary["input_frames"]
         write_json(out / "pipeline.json", summary)
-        if not summary["segments"] and not args.frame_fallback:
-            raise ValueError(
-                f"No metric intervals. Inspect {out / 'pipeline.json'} and session logs"
-            )
         evaluate_segments(summary, out, args.reference)
         if not args.vio_only:
-            run_boxer_segments(summary, out, args)
-            if args.frame_fallback:
-                run_frame_estimates(summary, out, args)
-        print(f"Usable metric frames: {summary['usable_frames']}/{len(frames)}")
+            run_inference(summary, out, args)
+        print(f"Usable metric frames: {summary['usable_frames']}/{summary['input_frames']}")
         print(f"Summary: {out / 'pipeline.json'}")
-        print("Remote SSH: download the MP4 in VS Code, or forward port 8000 and run:")
-        print(
-            f"  {sys.executable} -m http.server 8000 --bind 127.0.0.1 --directory {out}"
-        )
+        if not args.vio_only and not args.skip_viz:
+            print("Remote SSH: download the MP4 in VS Code, or forward port 8000 and run:")
+            print(
+                f"  {sys.executable} -m http.server 8000 --bind 127.0.0.1 --directory {out}"
+            )
     except (ValueError, OSError, RuntimeError, KeyError) as exc:
         parser.error(str(exc))
 

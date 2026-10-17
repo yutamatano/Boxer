@@ -282,7 +282,14 @@ The recommended end-to-end entry point is now `run_neon_pipeline.py`.
 It stops a SLAM session at the first loss/reset after metric initialization,
 exports the optimized camera poses and sparse map before they are erased,
 and restarts on the remaining source frames. Each valid interval is converted
-and processed by Boxer separately. See [Neon / Remote SSH workflow](docs/neon_pipeline.md)
+and processed by Boxer separately. Untracked frames, including images excluded
+from VIO for missing IMU coverage, are also inferred automatically. After inference,
+all frames are assembled under `<pipeline-output>/viewer/<recording>/`; the printed
+`view_tracker.py --input <recording> --output_dir <pipeline-output>/viewer --autoplay`
+command replays the full timeline. Independent SLAM worlds switch their point maps
+and tracker state instead of being fused together. `--frame-fallback` is retained
+for compatibility and is no longer required; `--skip_viz` omits inference videos
+while keeping Viewer CSVs. See [Neon / Remote SSH workflow](docs/neon_pipeline.md)
 for the diagnosis, outputs, and tested recording.
 
 ```bash

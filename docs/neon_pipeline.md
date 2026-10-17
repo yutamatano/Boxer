@@ -14,21 +14,29 @@ cd /home/ubint-lab/boxer
 source .venv/bin/activate
 
 python run_neon_pipeline.py \
-  --input neon_import_1 \
-  --output output/neon_run_01 \
-  --max_n 618 \
+  --input sample_data/neon_Htou \
+  --output output/neon_Htou_run_01 \
   --width 800 \
-  --imu-offset-ms 60 \
   --experimental-noise \
-  --frame-fallback \
-  --fuse
+  --skip_viz
+
+python view_tracker.py \
+  --input sample_data/neon_Htou \
+  --output_dir output/neon_Htou_run_01/viewer \
+  --autoplay
 ```
+
+`--max_n` を省略すると記録全体（既定上限999999フレーム）を処理します。
+動作確認なら `--max_n 30` などで入力範囲を限定できます。
+`--skip_viz` は推論時のJPEG/MP4生成を省略し、Viewer用のCSVは保存します。
+CPUを明示する場合は `--force_cpu`、区間ごとの融合も必要なら `--fuse` を追加します。
 
 `--input neon_import_1` は `sample_data/neon_import_1` の直下にある単一の
 記録フォルダも解決します。複数の記録がある場合は対象フォルダを直接指定します。
 出力先は空である必要があります。再試行では新しい名前を使ってください。
 
-上記の+60 msは今回の記録用の**試験設定**です。Neon一般の既定値ではありません。
+過去のneon_import_1で使用した+60 msは、その記録用の**試験設定**です。
+neon_Htouなど別の記録へ自動で引き継ぎません。
 既定の時刻補正は0 msです。校正済みの値があれば `--imu-offset-ms`、
 `--imu-noise noise.json`、`--extrinsics extrinsics.json` で指定してください。
 `--experimental-noise` は未校正のノイズ設定を明示的に許可します。
@@ -37,8 +45,8 @@ python run_neon_pipeline.py \
 実行する場合は同じ出力先に `--boxer-only` を指定します。
 
 ```bash
-python run_neon_pipeline.py --input neon_import_1 \
-  --output output/neon_run_01 --boxer-only --frame-fallback --fuse
+python run_neon_pipeline.py --input sample_data/neon_Htou \
+  --output output/neon_Htou_run_01 --boxer-only --skip_viz
 ```
 
 `--prepared PATH` を指定すると既存の前処理を再利用します。その場合、
@@ -50,8 +58,8 @@ Neon視線と推定3Dボックスの交点から注視位置の候補もCSV・�
 `--neon_gaze` は視線方向と画像表示のみ、`--gaze_max_delta_ms` は視線の
 時刻許容差（既定10 ms）です。
 `--point_cloud auto/on/off` は有効なSLAM軌跡区間のBoxer入力に適用します。
-軌跡のない `--frame-fallback` 区間は点群なしの独立したフレーム座標です。
-`--point_cloud on` と `--frame-fallback` は併用できません。
+軌跡のない区間は自動で点群なしの独立したフレーム座標として推論します。
+`--point_cloud on` の点群必須条件は、有効な軌跡区間にだけ適用します。
 座標と出力列の説明は[視線・注視位置の手順](neon_gaze_alignment.md)を参照してください。
 
 ## 出力と区間の扱い
@@ -64,6 +72,7 @@ output/neon_run_01/
   session_001/...            追跡失敗後の再開セッション
   boxer_000/<recording>/     3D検出・追跡・融合CSV、MP4
   frame_only_000/<recording>/ 未追跡フレームの独立した3D推定、MP4
+  viewer/<recording>/        全フレームを時刻順にまとめたViewer入力
   geometry_evaluation_000.json IMU整合性と、基準がある場合の誤差評価
   pipeline.json             有効区間、点群数、カバー率、結果パス
 ```
@@ -74,11 +83,14 @@ output/neon_run_01/
 採用します。未初期化・追跡失敗フレームを補間して埋めることはありません。
 区間ごとに原点が異なるので、独立したBoxer処理として出力します。
 
-`--frame-fallback` を指定すると、選択した入力フレームのうち有効な軌跡区間に
-含まれないフレームも推論します。これらの座標系は各フレームで独立した
+選択した入力フレームは、有効な軌跡区間に含まれないフレームも自動で推論します。
+IMUの前後サンプルがなくSLAMの前処理から除外された画像も、検出・再生には含めます。
+`--frame-fallback` は過去のコマンドとの互換用に受け付けますが、指定は不要です。
+軌跡なしの座標系は各フレームで独立した
 `per_frame_assumed_upright` であり、カメラ位置が計測できたという意味では
-ありません。点群・世界座標の追跡・融合は使わず、別のディレクトリへ保存します。
-`pipeline.json` の `coverage` は引き続き有効な世界軌跡の割合です。
+ありません。区間ごとの元データは別のディレクトリへ保存し、推論後に
+`viewer/<recording>/` へ検出CSV・視線CSV・フレーム表をまとめます。
+`pipeline.json` の `coverage` は選択した全画像に対する有効な世界軌跡の割合です。
 `frame_only_frames` と `total_estimated_frames` は独立して集計します。
 
 疎点群はSLAMが三角測量した点であり、深度センサーの測定ではありません。
@@ -94,11 +106,22 @@ output/neon_run_01/
 
 ## Viewerでの視線・注視点再生
 
-`--gaze_targets` で出力した区間は、`view_tracker.py` に同じ記録、
-区間のBoxer出力先、同じ `--neon_geometry` を指定して再生できます。
-点群がなくても `--point_cloud off` で3Dボックス・視線・推定注視点を表示します。
-`frame_fallback` の出力は姿勢を指定せず、各フレームのカメラ基準で再生します。
-独立したSLAM区間を同じ世界座標として混ぜないでください。
+処理終了時に、全フレーム再生用の `view_tracker.py` コマンドを表示します。
+同じコマンド列は `pipeline.json` の `viewer_command` に保存します。
+出力先は `--output_dir <pipeline出力>/viewer` で、軌跡・区間範囲の再指定は不要です。
+
+左・中央の画像は元の全フレームを連続再生します。軌跡がないフレームでも
+2D・3D検出を表示し、右の世界モデルは保持します。検出0件の画像も再生します。
+SLAM区間が変わると、右画面の点群・軌跡・Trackerをその区間の世界へ切り替えます。
+独立した世界同士を位置合わせしたり、Trackを共有したりはしません。
+逆方向・非連続のシークでは、従来どおり移動先から追跡を開始します。
+
+`--gaze_targets` で推論すれば、画像上の視線・推定注視候補も再生します。
+右画面には有効な姿勢がある時刻だけ視線・推定注視点を表示します。
+`--point_cloud off` をViewerに指定すれば、点群だけを非表示にした比較もできます。
+`viewer/` の入力は区間のCSV・メタデータ・姿勢NPZも参照するので、pipeline出力全体を
+保管してください。融合には `boxer_000` などの区間別出力を使います。
+軌跡が全く得られない場合も、全フレームの検出と画像再生を完了します。
 詳細なコマンドは[Viewerでの3D表示](neon_gaze_alignment.md#5-viewerで視線注視位置を3d表示)を参照してください。
 
 ## 原因調査と残る制約

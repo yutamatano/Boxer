@@ -202,6 +202,8 @@ def main():
                 parser.error("Cached Neon fusion requires input coordinate metadata")
             with open(metadata_path) as f:
                 metadata = json.load(f)
+            if "pipeline_parts" in metadata:
+                parser.error("Fuse individual pipeline segments; replay combines independent worlds")
             if metadata.get("coordinate_frame") not in (
                 "world_z_up", "mixed_world_and_per_frame"
             ):

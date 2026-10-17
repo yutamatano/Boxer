@@ -3345,6 +3345,13 @@ class SequenceOBBViewer(OBBViewer):
                 # Never connect a real world pose to an assumed local pose or
                 # draw a line across a missing-pose interval.
                 mask = valid[:-1] & valid[1:]
+                segments = getattr(self, "_neon_world_segment_by_time", None)
+                if segments is not None:
+                    current = np.array([
+                        segments[int(ts)] == self._active_neon_world_segment
+                        for ts in self.pose_ts
+                    ])
+                    mask &= current[:-1] & current[1:]
                 self._traj_all_segments = self._traj_all_segments[mask]
                 self._traj_seg_ts = self._traj_seg_ts[mask]
         else:
@@ -3971,6 +3978,9 @@ class TrackerViewer(SequenceOBBViewer):
         global _verbose_logging
         self._frame_local = bool(seq_ctx and seq_ctx.get("frame_local"))
         self._neon_world_pose_by_time = (seq_ctx or {}).get("world_pose_by_time")
+        self._neon_world_segment_by_time = (seq_ctx or {}).get("world_segment_by_time")
+        self._neon_world_contexts = (seq_ctx or {}).get("world_contexts", {})
+        self._active_neon_world_segment = (seq_ctx or {}).get("active_world_segment")
         self._current_frame_local = self._frame_local
         self._neon_world_update_idx = -1
         self._neon_last_tracked_ts = None
@@ -4922,14 +4932,51 @@ class TrackerViewer(SequenceOBBViewer):
                 [(self.obs_point_vbo, "3f 3f", "in_position", "in_color")],
             )
 
+    def _switch_neon_world(self, world_id: int) -> None:
+        """Select an independent SLAM world without aligning or fusing its map."""
+        frozen = self.freeze_tracker
+        self.freeze_tracker = False
+        self._reset_tracker()
+        self.freeze_tracker = frozen
+        self._active_neon_world_segment = world_id
+        assets = self._neon_world_contexts[world_id]
+        self._aria_uid_to_p3 = assets["uid_to_p3"]
+        self._aria_time_to_uids_slaml = assets["time_to_uids_slaml"]
+        self._aria_time_to_uids_slamr = assets["time_to_uids_slamr"]
+        for name in ("point_vao", "point_vbo", "point_inside_vao", "point_inside_vbo",
+                     "obs_point_vao", "obs_point_vbo"):
+            resource = getattr(self, name, None)
+            if resource is not None:
+                resource.release()
+                setattr(self, name, None)
+        had_points = self.point_count > 0
+        self._point_positions = None
+        self.point_count = self.point_inside_count = self.obs_point_count = 0
+        self._uid_to_idx = {}
+        self._time_to_uids_slaml = {}
+        self._time_to_uids_slamr = {}
+        self._all_obs_timestamps = np.array([])
+        show_obs, show_global = self.show_obs_points, self.show_global_points
+        self._load_semidense_points()
+        self.show_obs_points = show_obs
+        if had_points:
+            self.show_global_points = show_global
+        self._build_trajectory_geometry()
+        self._smooth_eye = self._smooth_target = self._smooth_up = None
+
     def _step_neon_tracker(self, target_idx: int) -> None:
         """Advance world tracking only on registered frames; RGB keeps all frames."""
-        if self.freeze_tracker:
-            return
         ts = self.sorted_timestamps[target_idx]
-        if target_idx not in (self.current_frame_idx, self.current_frame_idx + 1):
+        if not self.freeze_tracker and target_idx not in (
+            self.current_frame_idx, self.current_frame_idx + 1
+        ):
             self._reset_tracker()
         if not self._neon_world_pose_by_time[ts] or ts == self._neon_last_tracked_ts:
+            return
+        segments = getattr(self, "_neon_world_segment_by_time", None)
+        if segments is not None and segments[ts] != self._active_neon_world_segment:
+            self._switch_neon_world(segments[ts])
+        if self.freeze_tracker:
             return
         detections = self._filter_frame_obbs(self.timed_obbs[ts])
         cam, pose = self._get_cam_and_pose(ts)
@@ -6198,6 +6245,8 @@ class TrackerViewer(SequenceOBBViewer):
             )
         elif self._data_source == "neon":
             imgui.text("World 3D: registered camera trajectory")
+        if self._neon_world_segment_by_time is not None:
+            imgui.text(f"Independent SLAM world: {self._active_neon_world_segment}")
         if self._gaze_frames:
             self._section_header("Gaze")
             _, self.show_gaze_ray = imgui.checkbox("Ray (orange)", self.show_gaze_ray)
