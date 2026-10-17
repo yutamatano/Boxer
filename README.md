@@ -184,28 +184,56 @@ Add `--skip_viz` for CSV-only output or `--force_cpu` for CPU inference.
   patches use the existing missing-depth value `-1`; model weights are unchanged.
   Aria point/observation files are not loaded in this mode.
 - `--point_cloud on`: require valid points in every processed frame; missing
-  points cause an error rather than a silent fallback.
+  points cause an error. For Neon this requirement applies to frames with a
+  world pose; frames without a pose always use image-only 3D prediction.
 
 Without a camera trajectory, the 3D boxes are **independent per-frame estimates**
 in an assumed-upright local frame: X right, Y camera-forward, Z up. The camera
 origin is reset for each frame. This is not a measured world trajectory or gravity
 alignment; metric depth/size and prediction quality without points are unverified.
-`--track` and `--fuse` therefore require external registered camera poses for Neon.
+Neon `--track` updates only frames with registered camera poses; without any
+poses it retains per-frame detection. `--fuse` requires registered world geometry.
 In this frame-only mode, IMU orientation and gaze are not fused into predictions.
 
 Alongside the existing box CSVs, Neon writes `boxer_input.json` (coordinate/input
 semantics, original intrinsics and distortion) and `boxer_frames.csv` (selected
-source frame IDs, `.time` and `.time_aux` values). The prefix follows `--write_name`.
+source frame IDs, `.time`, `.time_aux` and `has_world_pose` values). The prefix follows `--write_name`.
 The frame table includes frames with zero detections; box CSVs contain detections
 only. `.time` is the primary clock, matching the official reader; `.time_aux` is
 preserved separately (`-1` if absent). Timestamps remain integer nanoseconds.
 To overlay raw gaze later, apply the same undistortion and resize to its pixel
 coordinates. `view_tracker.py` now replays Neon RGB, 3D boxes, exported gaze rays
-and estimated gaze targets. Use the same `--neon_geometry` as the Boxer run for
-world-coordinate replay, or omit it for independent camera-local frames with
-tracking disabled. Points are optional (`--point_cloud off`). See the
+and estimated gaze targets. New outputs remember the geometry path, so replay
+automatically uses the same NPZ; pass `--neon_geometry` if it has moved or for
+older outputs. Points are optional (`--point_cloud off`). See the
 [interactive gaze viewer commands](docs/neon_gaze_alignment.md#5-viewerで視線注視位置を3d表示).
 `view_fusion.py` does not yet support Neon recordings.
+
+Neon trajectories may cover only part of a recording. No manual frame-range
+selection is needed:
+
+```bash
+python run_boxer.py --input <recording> --start_n 0 \
+  --neon_geometry <registered_geometry.npz> --track --skip_viz \
+  --output_dir output/neon_all
+python view_tracker.py --input <recording> --output_dir output/neon_all --autoplay
+```
+
+Every selected frame receives 2D and 3D detection, including pose gaps. The
+image panels show per-frame boxes without a pose, while the world model holds
+its last tracked state; current-camera/visibility/gaze overlays are hidden.
+World tracking does not count pose gaps as missed detections. Replay keeps the
+original frame IDs and timestamps, including frames with no detections. As with
+existing tracker replay, nonsequential seeks reset tracking at the target frame.
+
+For partial coverage, metadata marks `mixed_world_and_per_frame` and each frame's
+`has_world_pose` distinguishes world boxes from independent assumed-upright boxes
+in `boxer_3dbbs.csv`. Keep this CSV with its metadata/frame table. Only world boxes
+are also written to `boxer_3dbbs_world.csv`; `run_boxer.py --fuse` (including
+`--cache3d --fuse`) uses that file. Pass the world-only file when using the fusion
+utility directly. A single geometry NPZ must describe one registered world;
+unregistered SLAM maps must still be processed separately. Existing global point
+clouds remain the supplied maps, not a reconstruction from the displayed frames.
 
 ### External point clouds and camera poses
 
@@ -214,7 +242,7 @@ from a phone or reconstruction. The NPZ must contain:
 
 | Key | Shape / dtype | Meaning |
 | --- | --- | --- |
-| `timestamps_ns` | `(F,)`, `int64`, strictly increasing | Exact scene `.time` values; must cover every selected frame |
+| `timestamps_ns` | `(F,)`, `int64`, strictly increasing | Exact scene `.time` values for available poses; missing frames remain camera-local |
 | `T_world_camera` | `(F, 4, 4)`, float | Rigid scene-camera-to-world transforms; right-handed Z-up world, translations in metres |
 | `points_world` (optional) | `(N, 3)` or `(F, N, 3)`, float | Static world map or per-frame observed points, in the same world frame and metres; all-NaN rows may pad variable counts |
 
@@ -366,13 +394,14 @@ map resets split segments; it never invents or interpolates missing poses.
 `report.json` includes coverage, segment ranges, speed/rotation-step statistics
 and calibration limitations. Empty/nonmetric results cause an error.
 
-Use a segment's **printed `--start_n` and `--max_n`** to select its exact frame
-range (replace the placeholders below):
+Use `--start_n 0` to process the full recording and automatically restrict world
+tracking to the supplied segment. Its printed `--start_n` and `--max_n` remain
+available if you want to process only that segment:
 
 ```bash
 python run_boxer.py --input 2026-09-30_15-22-47 \
   --neon_geometry output/neon_vio/2026-09-30_15-22-47/geometry/geometry_segment_000.npz \
-  --start_n <start_n> --max_n <max_n> --point_cloud off \
+  --start_n 0 --point_cloud off \
   --track --skip_viz --write_name boxer_vio_track
 # Replace --track with --fuse and use a different --write_name for fusion.
 ```

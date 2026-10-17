@@ -128,21 +128,25 @@ CSVの `[start_timestamp, end_timestamp)` 内のフレームのみ採用し、
 
 ## 4. 同じ座標系で物体と視線を出力
 
-`report.json` にある区間ごとに実行します。以下の `START` と `COUNT` を
-その区間の `start_n` と `max_n` の整数に置き換えてください。
+姿勢NPZを指定すると、対応するフレームを自動判定します。
+`--start_n 0` で記録全体を解析でき、区間の開始・終了フレームの指定は不要です。
 
 ```bash
 boxer/bin/python run_boxer.py \
   --input sample_data/<記録名> \
   --neon_geometry output/tag_alignment/geometry_segment_000.npz \
-  --start_n START --max_n COUNT --skip_n 1 \
+  --start_n 0 --skip_n 1 \
   --gaze_targets --point_cloud off --track --force_cpu \
   --labels chair,table,monitor \
   --output_dir output/neon_aligned_000
 ```
 
-選択フレームに対応する正確な姿勢がない場合はエラーになります。
-各区間は別の出力先で処理します。元の物体CSV・追跡履歴の形式はそのままです。
+姿勢がないフレームも2D・3D検出を行い、独立したカメラ基準の結果を保存します。
+`boxer_frames.csv` の `has_world_pose` が世界座標との対応の有無を表し、混在する
+出力の `coordinate_frame` は `mixed_world_and_per_frame` です。
+視線・注視候補の座標系もフレームごとに切り替わります。
+`boxer_3dbbs_world.csv` には世界座標の検出だけを保存し、融合にはこちらを使います。
+座標合わせされていない複数のSLAMマップは別の出力先で処理します。
 別のVIO/SLAMマップの点群を混ぜる場合、その点群も同じ実環境座標へ整列する
 必要があります。この変換コマンドは点群や3Dモデルを生成しません。
 
@@ -162,17 +166,19 @@ boxer/bin/python view_tracker.py \
   --output_dir output/neon_gaze --point_cloud off --autoplay
 ```
 
-この場合は「Camera-local 3D per frame」と表示されます。各フレームの
-カメラ中心を原点とした物体・視線を表示し、フレームをまたぐ追跡・軌跡表示は
-行いません。物体を部屋全体に配置した再構成ではありません。
+姿勢がないフレームでは「No camera pose」と表示されます。画像パネルには
+そのフレームの2D・3D検出と視線・注視候補を表示します。右の世界座標画面は
+それまでのモデルを保持し、現在のカメラ・視線・注視点は表示しません。
+軌跡が全くない入力では、世界座標のモデルは作成しません。
 
-SLAM3またはTag Alignerの姿勢を使って推論した出力では、**推論時と同じNPZ**が必要です。
+SLAM3またはTag Alignerの姿勢を使って推論した出力では、推論時のNPZパスを
+自動で読み込みます。NPZを移動した場合や旧出力には、同じNPZを
+`--neon_geometry` で指定してください。
 
 ```bash
 boxer/bin/python view_tracker.py \
   --input sample_data/<記録名> \
   --output_dir output/neon_aligned_000 \
-  --neon_geometry output/tag_alignment/geometry_segment_000.npz \
   --point_cloud off --autoplay
 ```
 

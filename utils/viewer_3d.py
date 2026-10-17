@@ -3337,11 +3337,25 @@ class SequenceOBBViewer(OBBViewer):
         self._traj_all_segments = traj_data.numpy().astype("f4")
         if len(self.pose_ts) >= 2:
             self._traj_seg_ts = self.pose_ts[:-1]
+            world_by_time = getattr(self, "_neon_world_pose_by_time", None)
+            if world_by_time is not None:
+                valid = np.array([
+                    world_by_time.get(int(ts), False) for ts in self.pose_ts
+                ])
+                # Never connect a real world pose to an assumed local pose or
+                # draw a line across a missing-pose interval.
+                mask = valid[:-1] & valid[1:]
+                self._traj_all_segments = self._traj_all_segments[mask]
+                self._traj_seg_ts = self._traj_seg_ts[mask]
         else:
             self._traj_seg_ts = None
 
     def _update_trajectory_tail(self, ts_ns: int) -> None:
         """Upload trajectory segments within trailing time window."""
+        world_by_time = getattr(self, "_neon_world_pose_by_time", None)
+        if world_by_time is not None and not world_by_time.get(int(ts_ns), False):
+            self.traj_instance_count = 0
+            return
         if self._traj_all_segments is None or self._traj_seg_ts is None:
             self.traj_instance_count = 0
             return
@@ -3383,6 +3397,9 @@ class SequenceOBBViewer(OBBViewer):
 
     def _build_frustum_geometry(self, cam: CameraTW, T_wr: PoseTW) -> None:
         """Build frustum line geometry for current frame camera pose."""
+        if getattr(self, "_current_frame_local", False):
+            self.frustum_instance_count = 0
+            return
         if self.frustum_instance_vbo is not None:
             self.frustum_instance_vbo.release()
             self.frustum_instance_vbo = None
@@ -3575,6 +3592,9 @@ class SequenceOBBViewer(OBBViewer):
 
     def _rebuild_rgb_projections(self) -> None:
         """Recompute projected 3DBB overlays for current frame."""
+        if getattr(self, "_neon_world_pose_by_time", None) is not None:
+            self._rebuild_current_view()
+            return
         self._rgb_projected_raw_lines = []
         self._rgb_projected_tracked_all_lines = []
         self._rgb_projected_tracked_visible_lines = []
@@ -3950,6 +3970,11 @@ class TrackerViewer(SequenceOBBViewer):
         self._prebuilt_seq_ctx = seq_ctx
         global _verbose_logging
         self._frame_local = bool(seq_ctx and seq_ctx.get("frame_local"))
+        self._neon_world_pose_by_time = (seq_ctx or {}).get("world_pose_by_time")
+        self._current_frame_local = self._frame_local
+        self._neon_world_update_idx = -1
+        self._neon_last_tracked_ts = None
+        self._last_world_frame_ts = None
         self._gaze_frames = (seq_ctx or {}).get("gaze_frames", {})
         self._gaze_overlay = None
         self._gaze_state = None
@@ -4292,6 +4317,11 @@ class TrackerViewer(SequenceOBBViewer):
                 all_obbs_for_init = self._all_frames_obbs
             else:
                 all_obbs_for_init = self.timed_obbs[self.sorted_timestamps[0]]
+                if (
+                    self._neon_world_pose_by_time is not None
+                    and not self._neon_world_pose_by_time[self.sorted_timestamps[0]]
+                ):
+                    all_obbs_for_init = ObbTW(torch.zeros(0, 165))
         else:
             all_obbs_for_init = ObbTW(torch.zeros(0, 165))
 
@@ -4426,7 +4456,11 @@ class TrackerViewer(SequenceOBBViewer):
             # No detections loaded: fall back to static orbit camera.
             return super().get_camera_matrices()
 
-        if not self.follow_view:
+        world_by_time = getattr(self, "_neon_world_pose_by_time", None)
+        ts = self.sorted_timestamps[self.current_frame_idx]
+        if world_by_time is not None and not world_by_time.get(ts, False):
+            ts = self._last_world_frame_ts
+        if not self.follow_view or ts is None:
             # Reset smoothing state when leaving follow mode
             self._smooth_eye = None
             self._smooth_target = None
@@ -4455,7 +4489,6 @@ class TrackerViewer(SequenceOBBViewer):
             mvp = np.eye(4, dtype="f4") @ view @ projection
             return projection, view, mvp
 
-        ts = self.sorted_timestamps[self.current_frame_idx]
         cam, T_wr = self._get_cam_and_pose(ts)
 
         # T_world_camera = T_world_rig @ T_rig_camera
@@ -4889,6 +4922,27 @@ class TrackerViewer(SequenceOBBViewer):
                 [(self.obs_point_vbo, "3f 3f", "in_position", "in_color")],
             )
 
+    def _step_neon_tracker(self, target_idx: int) -> None:
+        """Advance world tracking only on registered frames; RGB keeps all frames."""
+        if self.freeze_tracker:
+            return
+        ts = self.sorted_timestamps[target_idx]
+        if target_idx not in (self.current_frame_idx, self.current_frame_idx + 1):
+            self._reset_tracker()
+        if not self._neon_world_pose_by_time[ts] or ts == self._neon_last_tracked_ts:
+            return
+        detections = self._filter_frame_obbs(self.timed_obbs[ts])
+        cam, pose = self._get_cam_and_pose(ts)
+        self._neon_world_update_idx += 1
+        self.tracker.update(
+            detections, self._neon_world_update_idx, cam=cam, T_world_rig=pose,
+            observed_points=self._get_observed_points_trail(
+                ts, trail_duration_ns=int(self.obs_trail_secs * 1e9)
+            ),
+        )
+        self._neon_last_tracked_ts = ts
+        self._last_world_frame_ts = ts
+
     def _step_to_frame(self, target_idx: int) -> None:
         """Advance tracker to the target frame index.
 
@@ -4906,7 +4960,9 @@ class TrackerViewer(SequenceOBBViewer):
         if target_idx >= self.total_frames:
             target_idx = self.total_frames - 1
 
-        if self._frame_local:
+        if getattr(self, "_neon_world_pose_by_time", None) is not None:
+            self._step_neon_tracker(target_idx)
+        elif self._frame_local:
             # Independent camera frames cannot be fused or tracked across time.
             pass
         elif self.freeze_tracker:
@@ -4984,6 +5040,14 @@ class TrackerViewer(SequenceOBBViewer):
             verbose=self.tracker_verbose,
         )
         self.current_frame_idx = 0
+        self._neon_world_update_idx = -1
+        self._neon_last_tracked_ts = None
+        self._last_world_frame_ts = None
+        if self._neon_world_pose_by_time is not None:
+            # Resets/seeks into local frames must not retain a later world model.
+            self._upload_frame_data(None, None, None, [], [], [])
+            empty = self._empty_obbs_like()
+            self._set_frame_obb_sets(raw=empty, tracked_all=empty, tracked_visible=empty)
         self._cached_params_snapshot = self._get_params_snapshot()
 
     @staticmethod
@@ -5151,6 +5215,10 @@ class TrackerViewer(SequenceOBBViewer):
 
         # Get current frame detections
         ts = self.sorted_timestamps[self.current_frame_idx]
+        self._current_frame_local = (
+            self._neon_world_pose_by_time is not None
+            and not self._neon_world_pose_by_time[ts]
+        )
         nav_ts = self._get_navigation_timestamp(self.current_frame_idx, ts)
         current_detections = self._filter_frame_obbs(
             self.timed_obbs.get(ts, ObbTW(torch.zeros(0, 165)))
@@ -5161,7 +5229,11 @@ class TrackerViewer(SequenceOBBViewer):
         # Look up CSV 2D bounding boxes for current timestamp
         self._bb2d_current_boxes = []
         self._bb2d_img_wh: tuple[int, int] = (0, 0)
-        if self._bb2d_data is not None and self._bb2d_timestamps is not None:
+        if (
+            self._bb2d_data is not None
+            and self._bb2d_timestamps is not None
+            and len(self._bb2d_timestamps)
+        ):
             idx = int(find_nearest2(self._bb2d_timestamps, ts))
             nearest_ts = int(self._bb2d_timestamps[idx])
             # Neon uses the exact source clock; other datasets retain 50ms tolerance.
@@ -5199,7 +5271,10 @@ class TrackerViewer(SequenceOBBViewer):
                 from utils.gaze_viewer import GazeOverlay
 
                 self._gaze_overlay = GazeOverlay(self)
-            self._gaze_overlay.update(self._gaze_state, self.gaze_ray_length)
+            self._gaze_overlay.update(
+                None if self._current_frame_local else self._gaze_state,
+                self.gaze_ray_length,
+            )
 
         # Rebuild RGB projection caches for this frame (track mode path).
         self._rgb_projected_lines = []
@@ -5216,13 +5291,36 @@ class TrackerViewer(SequenceOBBViewer):
                 np.array([[0.6, 0.6, 0.6]], dtype=np.float32),
                 (len(current_detections), 1),
             )
-            raw_lines, _ = self._project_obbs_for_rgb(
+            raw_lines, raw_labels = self._project_obbs_for_rgb(
                 current_detections,
                 cam,
                 T_wr,
                 raw_colors,
             )
             self._rgb_projected_raw_lines = raw_lines
+
+        if self._current_frame_local:
+            # These boxes belong only to this image. Keep the last world model,
+            # without projecting its tracks through a fictitious camera pose.
+            if len(current_detections) > 0:
+                self._rgb_projected_tracked_all_lines = raw_lines
+                self._rgb_projected_tracked_visible_lines = raw_lines
+                self._rgb_projected_tracked_all_labels = raw_labels
+                self._rgb_projected_tracked_visible_labels = raw_labels
+            self._current_detection_count = len(current_detections)
+            self._active_track_count = len(self.tracker._get_active_tracks())
+            self._total_track_count = len(self.tracker.get_all_tracks())
+            self._set_frame_obb_sets(
+                raw=self._empty_obbs_like(current_detections),
+                tracked_all=self.frame_obb_sets.tracked_all,
+                tracked_visible=self._empty_obbs_like(current_detections),
+            )
+            self.cached_instance_count = 0
+            self.frustum_instance_count = 0
+            self.traj_instance_count = 0
+            self.outline_instance_count = 0
+            self.obs_point_count = 0
+            return
 
         # Update stats
         active_tracks = self.tracker._get_active_tracks()
@@ -6094,8 +6192,10 @@ class TrackerViewer(SequenceOBBViewer):
         )
 
         # === Playback Controls (kept identical to fusion) ===
-        if self._frame_local:
-            imgui.text_wrapped("Camera-local 3D per frame (no world trajectory). Tracking disabled.")
+        if self._current_frame_local:
+            imgui.text_wrapped(
+                "No camera pose: per-frame 3D in images only. World model held."
+            )
         elif self._data_source == "neon":
             imgui.text("World 3D: registered camera trajectory")
         if self._gaze_frames:
@@ -6522,7 +6622,7 @@ class TrackerViewer(SequenceOBBViewer):
                 imgui.set_next_window_position(panel_x, bottom_y, imgui.ALWAYS)
                 imgui.set_next_window_size(panel_w, bottom_h, imgui.ALWAYS)
             imgui.begin(
-                "Per-Frame 3DBBs" if self._frame_local else "Tracked 3DBBs",
+                "Per-Frame 3DBBs" if self._current_frame_local else "Tracked 3DBBs",
                 flags=imgui.WINDOW_NO_RESIZE | imgui.WINDOW_NO_MOVE,
             )
             # Draw image filling the panel (preserve aspect ratio)

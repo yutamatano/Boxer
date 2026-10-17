@@ -223,8 +223,8 @@ def test_headless_viewer_renders_hits_clears_misses_and_seeks(exported, monkeypa
             window.use()
             viewer.on_render(float(i), 1. / 30)
             viewer.ctx.finish()
-            assert overlay.has_ray == (i in (0, 1))
-            assert overlay.has_target == (i == 0)
+            assert overlay.has_ray == (geometry is not None and i in (0, 1))
+            assert overlay.has_target == (geometry is not None and i == 0)
             assert resource_ids == (overlay.line_vbo.glo, overlay.point_vbo.glo,
                                     overlay.line_vao.glo, overlay.point_vao.glo)
             pixels = np.frombuffer(window.fbo.read(components=3), dtype=np.uint8)
@@ -232,7 +232,7 @@ def test_headless_viewer_renders_hits_clears_misses_and_seeks(exported, monkeypa
             width, _ = viewer._get_3d_viewport_size()
             view = pixels[:, -width:]
             marker = (view[..., 0] > 240) & (view[..., 1] < 30) & (view[..., 2] > 180)
-            assert marker.sum() >= 25 if i == 0 else not marker.any()
+            assert marker.sum() >= 25 if geometry is not None and i == 0 else not marker.any()
         if context["frame_local"]:
             assert not viewer.tracker.get_all_tracks()
             assert viewer._traj_all_segments is None

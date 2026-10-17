@@ -90,8 +90,12 @@ def test_native_gaze_and_aligned_geometry_share_world(recording, tmp_path):
             assert meta["gaze"]["world_frame"] == "world_z_up"
         finally:
             loader.close()
-    with pytest.raises(ValueError, match="exact .time"):
-        NeonLoader(root, geometry_path=output / report["segments"][0]["geometry"])
+    loader = NeonLoader(root, geometry_path=output / report["segments"][0]["geometry"])
+    try:
+        assert loader.world_pose_valid.tolist() == [True, True, False, False, False]
+        assert len(list(loader)) == 5
+    finally:
+        loader.close()
     with pytest.raises(ValueError, match="empty"):
         convert(root, path, output, 0.001)
 
@@ -241,7 +245,7 @@ def test_truncated_timestamps_rejected(recording):
         NeonLoader(root)
 
 
-@pytest.mark.parametrize("flag", ["--track", "--fuse"])
+@pytest.mark.parametrize("flag", ["--fuse"])
 def test_cli_requires_trajectory_before_loading_models(recording, flag):
     root, _ = recording
     result = subprocess.run(

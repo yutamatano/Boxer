@@ -185,9 +185,9 @@ def main():
     if dataset_type == "neon":
         if args.camera != "rgb" or args.gt2d:
             parser.error("Neon uses the scene camera and has no --gt2d annotations")
-        if (args.track or args.fuse) and not args.neon_geometry:
+        if args.fuse and not args.neon_geometry and not args.cache3d:
             parser.error(
-                "Neon --track/--fuse requires --neon_geometry with registered "
+                "Neon --fuse requires --neon_geometry with registered "
                 "T_world_camera poses. Without a trajectory, use per-frame detection."
             )
         if args.cache3d and args.fuse:
@@ -202,7 +202,9 @@ def main():
                 parser.error("Cached Neon fusion requires input coordinate metadata")
             with open(metadata_path) as f:
                 metadata = json.load(f)
-            if metadata.get("coordinate_frame") != "world_z_up":
+            if metadata.get("coordinate_frame") not in (
+                "world_z_up", "mixed_world_and_per_frame"
+            ):
                 parser.error("Cannot fuse cached per-frame Neon boxes; rerun with poses")
 
     # get name of containing directory
@@ -210,6 +212,7 @@ def main():
     log_dir = os.path.join(output_dir, seq_name)
     os.makedirs(log_dir, exist_ok=True)
     csv_path = os.path.join(log_dir, f"{args.write_name}_3dbbs.csv")
+    fusion_csv_path = csv_path
     csv2d_out_path = os.path.join(log_dir, "owl_2dbbs.csv")
     print(f"==> Created output folder {log_dir}")
     _dbg("setup")
@@ -226,8 +229,15 @@ def main():
         if args.fuse:
             from utils.fuse_3d_boxes import fuse_obbs_from_csv
 
-            print(f"\n==> Running fusion on {csv_path}")
-            fuse_obbs_from_csv(csv_path)
+            if (
+                dataset_type == "neon"
+                and metadata["coordinate_frame"] == "mixed_world_and_per_frame"
+            ):
+                fusion_csv_path = os.path.join(
+                    log_dir, f"{args.write_name}_3dbbs_world.csv"
+                )
+            print(f"\n==> Running fusion on {fusion_csv_path}")
+            fuse_obbs_from_csv(fusion_csv_path)
 
         if os.path.exists(csv2d_out_path):
             print(f"==> 2D BB CSV exists: {csv2d_out_path}")
@@ -397,6 +407,11 @@ def main():
         sem_id_to_name = {v: k for k, v in sem_name_to_id.items()}
 
     writer = None if args.no_csv else ObbCsvWriter2(csv_path)
+    world_writer = None
+    if dataset_type == "neon" and loader.coordinate_frame == "mixed_world_and_per_frame":
+        fusion_csv_path = os.path.join(log_dir, f"{args.write_name}_3dbbs_world.csv")
+        if not args.no_csv:
+            world_writer = ObbCsvWriter2(fusion_csv_path)
     gaze_writer = (
         GazeCsvWriter(os.path.join(log_dir, f"{args.write_name}_gaze.csv"))
         if args.neon_gaze and not args.no_csv else None
@@ -412,7 +427,8 @@ def main():
             return None
         target = estimate_gaze_target(
             datum["gaze"], obbs, datum["T_world_rig0"].matrix.cpu().numpy(),
-            loader.coordinate_frame, point_cloud_used=bool(datum["sdp_w"].numel()),
+            datum.get("coordinate_frame", loader.coordinate_frame),
+            point_cloud_used=bool(datum["sdp_w"].numel()),
         )
         target_counts[target["status"]] += 1
         if target_writer is not None:
@@ -420,7 +436,7 @@ def main():
         return target
 
     tracker = None
-    if args.track:
+    if args.track and (dataset_type != "neon" or loader.has_world_poses):
         from utils.track_3d_boxes import BoundingBox3DTracker
 
         tracker = BoundingBox3DTracker(
@@ -451,6 +467,7 @@ def main():
 
     timestamps_ns = []  # Collect timestamps to compute FPS
     tracked_history = []
+    world_frame_idx = -1
     timer = CudaTimer(device)
     pbar = tqdm(range(len(loader)), desc="BoxerNet")
     DEBUG_VIZ = os.environ.get("DEBUG_VIZ", "0") == "1"
@@ -469,6 +486,10 @@ def main():
         if datum is False:
             pbar.set_postfix_str("Skipped (time misalignment)")
             continue
+
+        world_frame = datum.get("has_world_pose", True)
+        if world_frame:
+            world_frame_idx += 1
 
         if DEBUG_VIZ:
             _tl1 = time.perf_counter()
@@ -496,7 +517,7 @@ def main():
             datum["sdp_w"] = torch.empty(0, 3)
         else:
             datum.setdefault("sdp_w", torch.empty(0, 3))
-        if args.point_cloud == "on":
+        if args.point_cloud == "on" and world_frame:
             if not torch.isfinite(datum["sdp_w"]).all(dim=-1).any():
                 raise ValueError(
                     f"Point cloud required but missing at time {datum['time_ns0']}"
@@ -641,6 +662,8 @@ def main():
         time_ns = int(datum["time_ns0"])
         if writer is not None:
             writer.write(obb_pr_w, time_ns, sem_id_to_name=sem_id_to_name)
+            if world_writer is not None and world_frame:
+                world_writer.write(obb_pr_w, time_ns, sem_id_to_name=sem_id_to_name)
 
             # Convert bb2d from boxer format (x1, x2, y1, y2) to standard (x1, y1, x2, y2)
             bb2d_xyxy = bb2d[:, [0, 2, 1, 3]]
@@ -663,13 +686,15 @@ def main():
         t_csv = timer.stop("csv")
 
         active_tracks = None
-        if tracker is not None:
+        t_track = 0.0
+        if tracker is not None and world_frame:
             timer.start("track")
             observed_points = datum.get("observed_points", sdp_w)
             if args.point_cloud == "off" or sdp_w.numel() == 0:
                 observed_points = None
             active_tracks = tracker.update(
-                obb_pr_w, ii, cam=cam, T_world_rig=T_wr,
+                obb_pr_w, world_frame_idx if dataset_type == "neon" else ii,
+                cam=cam, T_world_rig=T_wr,
                 observed_points=observed_points,
             )
             if active_tracks:
@@ -884,6 +909,9 @@ def main():
         writer.close()
         print(f"==> Saved 3D BBs to {csv_path}")
         print(f"==> Saved 2D BBs to {csv2d_out_path}")
+    if world_writer is not None:
+        world_writer.close()
+        print(f"==> Saved world-only 3D BBs to {fusion_csv_path}")
 
     if args.viz_headless:
         # Calculate FPS from RGB timestamps
@@ -910,8 +938,8 @@ def main():
     if args.fuse:
         from utils.fuse_3d_boxes import fuse_obbs_from_csv
 
-        print(f"\n==> Running fusion on {csv_path}")
-        fuse_obbs_from_csv(csv_path)
+        print(f"\n==> Running fusion on {fusion_csv_path}")
+        fuse_obbs_from_csv(fusion_csv_path)
 
     if tracker is not None and tracked_history:
         base, ext = os.path.splitext(csv_path)

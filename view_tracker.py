@@ -41,7 +41,7 @@ def main():
     # fmt: on
     parser.add_argument(
         "--neon_geometry", type=str,
-        help="The same metric Z-up geometry NPZ used to generate the Neon CSV",
+        help="Neon metric Z-up geometry NPZ (default: path saved by run_boxer)",
     )
     parser.add_argument(
         "--point_cloud", choices=("auto", "on", "off"), default="auto",

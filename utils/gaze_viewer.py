@@ -33,7 +33,8 @@ def _vector(row, prefix):
     return values
 
 
-def load_gaze_frames(root, prefix, frame_ids, timestamps, poses, coordinate_frame):
+def load_gaze_frames(root, prefix, frame_ids, timestamps, poses, coordinate_frame,
+                     world_pose_valid=None):
     """Load optional CSVs once; missing rows remain missing during seeks/replay.
 
     Saved world rays and both target coordinate representations must agree with
@@ -46,7 +47,12 @@ def load_gaze_frames(root, prefix, frame_ids, timestamps, poses, coordinate_fram
     if set(targets) - set(gaze):
         raise ValueError("Gaze targets require matching gaze CSV rows")
     result = {}
-    for ts, pose in zip(map(int, timestamps), poses):
+    for index, (ts, pose) in enumerate(zip(map(int, timestamps), poses)):
+        frame_coordinates = coordinate_frame
+        if world_pose_valid is not None:
+            frame_coordinates = (
+                "world_z_up" if world_pose_valid[index] else "per_frame_assumed_upright"
+            )
         row = gaze.get(ts)
         if row is None:
             continue
@@ -55,7 +61,7 @@ def load_gaze_frames(root, prefix, frame_ids, timestamps, poses, coordinate_fram
         result[ts] = state
         target = targets.get(ts)
         if target is not None:
-            if target["coordinate_frame"] != coordinate_frame:
+            if target["coordinate_frame"] != frame_coordinates:
                 raise ValueError("Gaze target coordinate_frame differs from detections")
             if any(target[key] != row[key] for key in ("gaze_time_ns", "gaze_delta_ns")):
                 raise ValueError("Gaze target uses a different gaze sample")
@@ -69,7 +75,7 @@ def load_gaze_frames(root, prefix, frame_ids, timestamps, poses, coordinate_fram
             raise ValueError("Gaze direction must be a unit vector")
         origin = np.asarray(pose[:3, 3], dtype=np.float64)
         direction = pose[:3, :3] @ direction_camera
-        if coordinate_frame == "world_z_up":
+        if frame_coordinates == "world_z_up":
             if row["status"] != "world_ray" or not (
                 np.allclose(_vector(row, "origin_world"), origin, atol=1e-4, rtol=0)
                 and np.allclose(_vector(row, "direction_world"), direction, atol=1e-4, rtol=0)

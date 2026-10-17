@@ -125,11 +125,16 @@ class NeonLoader(BaseLoader):
 
             self.poses = None
             self.points = None
-            self.geometry_indices = None
+            self.geometry_indices = np.full(self.length, -1, dtype=np.int64)
+            self.geometry_path = (
+                str(Path(geometry_path).expanduser().resolve())
+                if geometry_path else None
+            )
             self.alignment_metadata = None
             if geometry_path is not None:
                 self._load_geometry(geometry_path, load_points=point_cloud != "off")
-            self.has_world_poses = self.poses is not None
+            self.world_pose_valid = self.geometry_indices >= 0
+            self.has_world_poses = bool(self.world_pose_valid.any())
             self.use_points = point_cloud != "off" and self.points is not None
             if point_cloud == "on" and not self.use_points:
                 raise ValueError(
@@ -139,6 +144,8 @@ class NeonLoader(BaseLoader):
             self.coordinate_frame = (
                 "world_z_up" if self.has_world_poses else "per_frame_assumed_upright"
             )
+            if self.has_world_poses and not self.world_pose_valid.all():
+                self.coordinate_frame = "mixed_world_and_per_frame"
             self.gaze = None
             if gaze:
                 from utils.neon_gaze import NeonGaze
@@ -154,6 +161,10 @@ class NeonLoader(BaseLoader):
 
         print(f"==> Neon: {len(self.scene)} scene frames, {self.length} selected")
         print(f"==> Point cloud: {'on' if self.use_points else 'off'}")
+        print(
+            f"==> World poses: {int(self.world_pose_valid.sum())}/{self.length}; "
+            "remaining frames use independent camera-local 3D predictions"
+        )
         if not self.has_world_poses:
             print(
                 "==> No camera trajectory: per-frame 3D predictions assume an upright "
@@ -179,14 +190,17 @@ class NeonLoader(BaseLoader):
                 )
             if np.any(np.diff(ts) <= 0):
                 raise ValueError("Geometry timestamps_ns must be strictly increasing")
-            selected_ts = self.timestamps_ns[self.frame_indices]
-            indices = np.searchsorted(ts, selected_ts)
-            if np.any(indices == len(ts)) or not np.array_equal(
-                ts[indices], selected_ts
+            source_indices = np.searchsorted(self.timestamps_ns, ts)
+            if np.any(source_indices == len(self.timestamps_ns)) or not np.array_equal(
+                self.timestamps_ns[source_indices], ts
             ):
                 raise ValueError(
-                    "Geometry must contain the exact .time of every selected frame"
+                    "Geometry timestamps must match the exact .time of source frames"
                 )
+            selected_ts = self.timestamps_ns[self.frame_indices]
+            indices = np.searchsorted(ts, selected_ts)
+            matched = ts[np.minimum(indices, len(ts) - 1)] == selected_ts
+            indices = np.where(matched, indices, -1)
             poses = np.asarray(data["T_world_camera"], dtype=np.float64)
             if poses.shape != (len(ts), 4, 4) or not np.isfinite(poses).all():
                 raise ValueError(
@@ -225,6 +239,20 @@ class NeonLoader(BaseLoader):
                     )
                 self.points = points
 
+    @staticmethod
+    def local_camera_pose():
+        """OpenCV camera to an assumed-upright local frame, never a world pose."""
+        return PoseTW.from_Rt(
+            torch.tensor([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]]),
+            torch.zeros(3),
+        )
+
+    def frame_pose(self, idx):
+        if self.world_pose_valid[idx]:
+            matrix = self.poses[self.geometry_indices[idx]]
+            return PoseTW.from_matrix(torch.from_numpy(matrix))
+        return self.local_camera_pose()
+
     def load(self, idx):
         frame_index = int(self.frame_indices[idx])
         image = self.scene[frame_index].bgr
@@ -255,18 +283,12 @@ class NeonLoader(BaseLoader):
         image = cv2.remap(image, *self._maps, interpolation=cv2.INTER_LINEAR)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        if self.has_world_poses:
-            geometry_index = int(self.geometry_indices[idx])
-            pose = PoseTW.from_matrix(torch.from_numpy(self.poses[geometry_index]))
-        else:
-            # OpenCV camera (right, down, forward) -> assumed Z-up local frame.
-            pose = PoseTW.from_Rt(
-                torch.tensor([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]]),
-                torch.zeros(3),
-            )
+        has_world_pose = bool(self.world_pose_valid[idx])
+        geometry_index = int(self.geometry_indices[idx])
+        pose = self.frame_pose(idx)
         points = torch.empty((0, 3), dtype=torch.float32)
         observed_points = None
-        if self.use_points:
+        if self.use_points and has_world_pose:
             per_frame = self.points.ndim == 3
             values = self.points[geometry_index] if per_frame else self.points
             points = torch.from_numpy(values[np.isfinite(values).all(axis=-1)])
@@ -282,12 +304,16 @@ class NeonLoader(BaseLoader):
             "time_ns0": int(self.timestamps_ns[frame_index]),
             "frame_id": frame_index,
             "orig_size0": (width, height),
+            "has_world_pose": has_world_pose,
+            "coordinate_frame": (
+                "world_z_up" if has_world_pose else "per_frame_assumed_upright"
+            ),
         }
         if self.gaze is not None:
             datum["gaze"] = self.gaze.sample(
                 frame_index, datum["time_ns0"], self.K, self.distortion, self._K_out,
                 (width, height), (out_w, out_h),
-                self.poses[geometry_index] if self.has_world_poses else None,
+                self.poses[geometry_index] if has_world_pose else None,
             )
         return datum
 
@@ -295,6 +321,7 @@ class NeonLoader(BaseLoader):
         """Preserve the frame/time mapping even for frames with no detections."""
         root = Path(output_dir)
         metadata = {
+            "schema_version": 2,
             "dataset": "neon",
             "coordinate_frame": self.coordinate_frame,
             "point_cloud": "on" if self.use_points else "off",
@@ -307,6 +334,11 @@ class NeonLoader(BaseLoader):
             "scene_camera_matrix": self.K.tolist(),
             "scene_distortion_coefficients": self.distortion.tolist(),
             "has_world_poses": self.has_world_poses,
+            "geometry_path": self.geometry_path if self.has_world_poses else None,
+            "world_pose_frames": int(self.world_pose_valid.sum()),
+            "frame_pose_status": (
+                "has_world_pose in the frame CSV; 0 = independent local 3D"
+            ),
             "alignment": self.alignment_metadata,
             "gaze": None if self.gaze is None else {
                 "sampling": "one nearest native binocular gaze sample per selected frame",
@@ -338,10 +370,11 @@ class NeonLoader(BaseLoader):
         np.savetxt(
             root / f"{write_name}_frames.csv",
             np.column_stack(
-                (indices, self.timestamps_ns[indices], self.aux_timestamps_ns[indices])
+                (indices, self.timestamps_ns[indices], self.aux_timestamps_ns[indices],
+                 self.world_pose_valid.astype(np.int64))
             ),
             fmt="%d", delimiter=",", comments="",
-            header="frame_id,time_ns,time_aux_ns",
+            header="frame_id,time_ns,time_aux_ns,has_world_pose",
         )
 
     def close(self):
