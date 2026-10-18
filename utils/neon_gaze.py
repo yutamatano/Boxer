@@ -90,7 +90,7 @@ def draw_gaze(image, row):
     """Draw on a visualization copy only; never modify a detector input."""
     if row is not None and row["in_image"]:
         pixel = (round(row["image_x"]), round(row["image_y"]))
-        cv2.circle(image, pixel, 9, (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.circle(image, pixel, 9, (0, 255, 255), 2, cv2.LINE_AA)
-        cv2.drawMarker(image, pixel, (0, 255, 255), cv2.MARKER_CROSS, 9, 1)
+        cv2.circle(image, pixel, 18, (0, 0, 0), 8, cv2.LINE_AA)
+        cv2.circle(image, pixel, 18, (0, 0, 255), 4, cv2.LINE_AA)
+        cv2.drawMarker(image, pixel, (0, 0, 255), cv2.MARKER_CROSS, 18, 2)
     return image

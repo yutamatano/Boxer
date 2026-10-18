@@ -5086,8 +5086,8 @@ class TrackerViewer(SequenceOBBViewer):
                 # The LRU stores unannotated images; never accumulate old markers.
                 rgb = rgb.copy()
                 pixel = tuple(np.rint(state["image_xy"] * self._rgb_img_scale).astype(int))
-                cv2.circle(rgb, pixel, 9, (0, 0, 0), 4, cv2.LINE_AA)
-                cv2.circle(rgb, pixel, 9, (255, 115, 0), 2, cv2.LINE_AA)
+                cv2.circle(rgb, pixel, 18, (0, 0, 0), 8, cv2.LINE_AA)
+                cv2.circle(rgb, pixel, 18, (255, 0, 0), 4, cv2.LINE_AA)
                 if state["target"] is not None:
                     cv2.circle(rgb, pixel, 4, (255, 0, 204), -1, cv2.LINE_AA)
             self._upload_rgb_texture(rgb)
