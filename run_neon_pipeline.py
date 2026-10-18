@@ -12,6 +12,7 @@ from pathlib import Path
 from convert_neon_trajectory import convert
 from evaluate_neon_geometry import evaluate
 from utils.neon_pipeline_viewer import assemble_replay, selected_frame_ids
+from utils.neon_progress import StageProgress
 from utils.neon_vio import read_csv, recording_path, write_json
 
 ROOT = Path(__file__).resolve().parent
@@ -28,24 +29,49 @@ def gaze_options(args):
     return options
 
 
-def run_logged(command, log, env=None, allowed=(0,)):
+def run_logged(command, log, env=None, allowed=(0,), *, progress=None):
     print("Running:", " ".join(map(str, command)), flush=True)
     print(f"Log: {log}", flush=True)
+    worker_env = dict(os.environ if env is None else env)
+    worker_env["PYTHONUNBUFFERED"] = "1"
+    if progress:
+        progress.update(progress.offset, status="開始", force=True)
     with log.open("w") as stream:
-        result = subprocess.run(
+        process = subprocess.Popen(
             list(map(str, command)),
             stdout=stream,
             stderr=subprocess.STDOUT,
-            env=env,
+            env=worker_env,
             cwd=ROOT,
         )
-    if result.returncode not in allowed:
-        raise RuntimeError(f"Command failed ({result.returncode}); inspect {log}")
-    return result.returncode
+        try:
+            while True:
+                try:
+                    code = process.wait(timeout=1)
+                    break
+                except subprocess.TimeoutExpired:
+                    if progress:
+                        progress.poll(log)
+        except BaseException:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            raise
+    if progress:
+        progress.poll(log)
+        progress.finish(code in allowed)
+    if code not in allowed:
+        raise RuntimeError(f"Command failed ({code}); inspect {log}")
+    return code
 
 
 def run_boxer_segments(summary, out, args):
     recording = Path(summary["recording"])
+    completed = 0
+    total = summary.get("input_frames", sum(s["max_n"] for s in summary["segments"]))
     for i, segment in enumerate(summary["segments"]):
         results = out / f"boxer_{i:03d}"
         command = [
@@ -76,7 +102,11 @@ def run_boxer_segments(summary, out, args):
         if getattr(args, "skip_viz", False):
             command += ["--skip_viz"]
         command += gaze_options(args)
-        run_logged(command, out / f"boxer_{i:03d}.log")
+        run_logged(command, out / f"boxer_{i:03d}.log", progress=StageProgress(
+            out, "物体検出・3D推論", total, offset=completed,
+            source="inference", detail=f"軌跡あり区間 {i + 1}/{len(summary['segments'])}",
+        ))
+        completed += segment["max_n"]
         if args.fuse:
             run_logged(
                 [
@@ -87,6 +117,8 @@ def run_boxer_segments(summary, out, args):
                     results / recording.name / "boxer_3dbbs.csv",
                 ],
                 out / f"fusion_{i:03d}.log",
+                progress=StageProgress(out, "3D物体融合", 1,
+                                       detail=f"区間 {i + 1}/{len(summary['segments'])}"),
             )
         segment["results"] = str(results / recording.name)
         write_json(out / "pipeline.json", summary)
@@ -115,9 +147,9 @@ def uncovered_intervals(frame_ids, segments):
 
 def run_frame_estimates(summary, out, args):
     recording = Path(summary["recording"])
-    intervals = uncovered_intervals(
-        selected_frame_ids(summary["prepared"]), summary["segments"]
-    )
+    frame_ids = selected_frame_ids(summary["prepared"])
+    intervals = uncovered_intervals(frame_ids, summary["segments"])
+    completed = summary["usable_frames"]
     summary["frame_only_intervals"] = []
     for i, interval in enumerate(intervals):
         results = out / f"frame_only_{i:03d}"
@@ -146,7 +178,11 @@ def run_frame_estimates(summary, out, args):
         if getattr(args, "skip_viz", False):
             command += ["--skip_viz"]
         command += gaze_options(args)
-        run_logged(command, out / f"frame_only_{i:03d}.log")
+        run_logged(command, out / f"frame_only_{i:03d}.log", progress=StageProgress(
+            out, "物体検出・3D推論", len(frame_ids), offset=completed,
+            source="inference", detail=f"軌跡なし区間 {i + 1}/{len(intervals)}",
+        ))
+        completed += interval["max_n"]
         summary["frame_only_intervals"].append(
             dict(
                 interval,
@@ -165,17 +201,24 @@ def run_frame_estimates(summary, out, args):
 
 
 def evaluate_segments(summary, out, reference=None):
-    for i, segment in enumerate(summary["segments"]):
-        output = out / f"geometry_evaluation_{i:03d}.json"
-        evaluate(summary["prepared"], segment["geometry"], output, reference)
-        segment["evaluation"] = str(output)
+    if not summary["segments"]:
+        StageProgress(out, "軌跡評価", 0).update(0, status="対象区間なし", force=True)
+        write_json(out / "pipeline.json", summary)
+        return
+    with StageProgress(out, "軌跡評価", len(summary["segments"])) as progress:
+        for i, segment in enumerate(summary["segments"]):
+            output = out / f"geometry_evaluation_{i:03d}.json"
+            evaluate(summary["prepared"], segment["geometry"], output, reference)
+            segment["evaluation"] = str(output)
+            progress.update(i + 1)
     write_json(out / "pipeline.json", summary)
 
 
 def run_inference(summary, out, args):
     run_boxer_segments(summary, out, args)
     run_frame_estimates(summary, out, args)
-    viewer_output = assemble_replay(summary, out)
+    with StageProgress(out, "Viewer用結果統合", 1):
+        viewer_output = assemble_replay(summary, out)
     command = [sys.executable, str(ROOT / "view_tracker.py"), "--input",
                summary["recording"], "--output_dir", str(viewer_output), "--autoplay"]
     if getattr(args, "require_gpu", False):
@@ -249,6 +292,7 @@ def main():
                 raise ValueError("Existing pipeline has no matching usable recording")
             evaluate_segments(summary, out, args.reference)
             run_inference(summary, out, args)
+            StageProgress(out, "選択した全工程", 1).finish(True)
             print(f"Results: {out}")
             return
         if out.exists() and any(out.iterdir()):
@@ -273,6 +317,7 @@ def main():
                 "Reusing prepared input, including its calibration and clock settings.",
                 flush=True,
             )
+            StageProgress(out, "前処理", 1).update(1, status="既存データを再利用", force=True)
         else:
             command = [
                 sys.executable,
@@ -300,7 +345,9 @@ def main():
                     command += ["--" + flag.replace("_", "-"), getattr(args, flag)]
             if args.experimental_noise:
                 command += ["--experimental-noise"]
-            run_logged(command, out / "prepare.log")
+            run_logged(command, out / "prepare.log", progress=StageProgress(
+                out, "前処理", None, source="prepare",
+            ))
             manifest = json.loads((prepared / "manifest.json").read_text())
         frames = read_csv(prepared / "frames.csv")
         env = os.environ.copy()
@@ -344,6 +391,11 @@ def main():
                 session / "slam.log",
                 env,
                 allowed=(0, 3),
+                progress=StageProgress(
+                    out, "カメラ軌跡推定", len(frames), offset=start_index,
+                    source="slam", states=session / "slam/states.csv",
+                    detail=f"セッション {session_id + 1}",
+                ),
             )
             state = json.loads((session / "slam/run.json").read_text())
             next_index = state["next_index"]
@@ -352,28 +404,29 @@ def main():
             state["session"] = session_id
             summary["sessions"].append(state)
             geometry = session / "geometry"
-            try:
-                report = convert(
-                    prepared,
-                    session / "slam/camera_trajectory.csv",
-                    session / "slam/states.csv",
-                    geometry,
-                    args.min_frames,
-                    points=session / "slam/map_points.csv",
-                    allow_partial=True,
-                )
-            except ValueError:
-                # Only an explicitly diagnosed lack of usable intervals is recoverable.
-                if not (geometry / "report.json").is_file():
-                    raise
-                report = json.loads((geometry / "report.json").read_text())
-                if report["segments"]:
-                    raise
-                print(
-                    f"Session {session_id}: no usable metric interval; "
-                    f"see {geometry / 'report.json'}",
-                    flush=True,
-                )
+            with StageProgress(out, "軌跡変換", 1, detail=f"セッション {session_id + 1}"):
+                try:
+                    report = convert(
+                        prepared,
+                        session / "slam/camera_trajectory.csv",
+                        session / "slam/states.csv",
+                        geometry,
+                        args.min_frames,
+                        points=session / "slam/map_points.csv",
+                        allow_partial=True,
+                    )
+                except ValueError:
+                    # Only an explicitly diagnosed lack of usable intervals is recoverable.
+                    if not (geometry / "report.json").is_file():
+                        raise
+                    report = json.loads((geometry / "report.json").read_text())
+                    if report["segments"]:
+                        raise
+                    print(
+                        f"Session {session_id}: no usable metric interval; "
+                        f"see {geometry / 'report.json'}",
+                        flush=True,
+                    )
             for segment in report["segments"]:
                 item = dict(
                     segment,
@@ -396,6 +449,7 @@ def main():
             print(
                 f"  {sys.executable} -m http.server 8000 --bind 127.0.0.1 --directory {out}"
             )
+        StageProgress(out, "選択した全工程", 1).finish(True)
     except (ValueError, OSError, RuntimeError, KeyError) as exc:
         parser.error(str(exc))
 

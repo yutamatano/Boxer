@@ -286,7 +286,7 @@ def prepare(args):
                     if rotation is not None:
                         pairs.append((previous[0], image_seconds[index], rotation))
                 previous = (image_seconds[index], gray)
-                if n % 100 == 0:
+                if n % 100 == 0 or n + 1 == len(indices):
                     print(f"Prepared {n + 1}/{len(indices)} frames", flush=True)
         frequency = float((len(imu_ns) - 1) / ((imu_ns[-1] - imu_ns[0]) * 1e-9))
         fps = float(

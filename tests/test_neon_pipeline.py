@@ -9,7 +9,7 @@ from utils.neon_vio import recording_path
 def test_boxer_intervals_have_separate_outputs_and_fusion_stage(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(
-        pipeline, "run_logged", lambda command, log: calls.append(command)
+        pipeline, "run_logged", lambda command, log, **kwargs: calls.append(command)
     )
     summary = {
         "recording": str(tmp_path / "recording"),
@@ -75,7 +75,7 @@ def test_untracked_intervals_preserve_source_gaps_and_reject_overlap():
 def test_frame_estimates_never_receive_world_poses_or_tracking(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(
-        pipeline, "run_logged", lambda command, log: calls.append(command)
+        pipeline, "run_logged", lambda command, log, **kwargs: calls.append(command)
     )
     prepared = tmp_path / "prepared"
     prepared.mkdir()

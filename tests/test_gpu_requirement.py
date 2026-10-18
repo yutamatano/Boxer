@@ -32,7 +32,7 @@ def test_require_gpu_fails_before_data_loading(module, force_cpu, monkeypatch, c
 
 def test_pipeline_forwards_gpu_requirement_to_all_intervals(tmp_path, monkeypatch):
     calls = []
-    monkeypatch.setattr(pipeline, "run_logged", lambda command, log: calls.append(command))
+    monkeypatch.setattr(pipeline, "run_logged", lambda command, log, **kwargs: calls.append(command))
     monkeypatch.setattr(pipeline, "selected_frame_ids", lambda path: [0, 1, 2, 3])
     summary = dict(
         recording=str(tmp_path / "recording"), prepared="unused",
