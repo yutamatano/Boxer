@@ -193,7 +193,8 @@ def _load_cached_text_embeddings():
     """Try to load cached text embeddings from OWL checkpoint cache files.
 
     Returns:
-        Dict mapping text string -> embedding tensor, or None if no cache found.
+        Dict mapping text string -> CPU float32 embedding, or None if unavailable.
+        Lowercase aliases match both the tokenizer and CSV label serialization.
     """
     import glob as glob_mod
 
@@ -201,18 +202,22 @@ def _load_cached_text_embeddings():
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ckpts"
     )
     cache_files = glob_mod.glob(os.path.join(ckpts_dir, "owlv2-*_textemb_*.pt"))
-    if not cache_files:
-        return None
-    cached = torch.load(cache_files[0], map_location="cpu", weights_only=False)
-    if (
-        not isinstance(cached, dict)
-        or "prompts" not in cached
-        or "embeddings" not in cached
-    ):
-        return None
-    prompts = cached["prompts"]
-    embeddings = cached["embeddings"]
-    return {text: embeddings[i] for i, text in enumerate(prompts)}
+    for path in sorted(cache_files):
+        cached = torch.load(path, map_location="cpu", weights_only=False)
+        if (
+            not isinstance(cached, dict)
+            or "prompts" not in cached
+            or "embeddings" not in cached
+        ):
+            # Legacy tensors have no label mapping; try another labelled cache.
+            continue
+        prompts = cached["prompts"]
+        embeddings = cached["embeddings"].float()
+        result = {text: embeddings[i] for i, text in enumerate(prompts)}
+        for text, embedding in list(result.items()):
+            result.setdefault(text.lower(), embedding)
+        return result
+    return None
 
 
 def precompute_semantic_embeddings(
@@ -254,7 +259,9 @@ def precompute_semantic_embeddings(
         missing = [t for t in unique_texts if t not in cache]
         if not missing:
             print(f"  Loaded all {unique_count} embeddings from OWL cache")
-            unique_embeddings = torch.stack([cache[t] for t in unique_texts])
+            unique_embeddings = torch.nn.functional.normalize(
+                torch.stack([cache[t] for t in unique_texts]).float(), dim=-1
+            )
             text_indices_tensor = torch.tensor(text_indices, dtype=torch.long)
             return unique_embeddings[text_indices_tensor]
         else:
@@ -266,7 +273,9 @@ def precompute_semantic_embeddings(
     from owl.clip_tokenizer import TextEmbedder
 
     model = TextEmbedder()
-    unique_embeddings = model.forward(unique_texts)
+    unique_embeddings = torch.nn.functional.normalize(
+        model.forward(unique_texts).float(), dim=-1
+    )
     text_indices_tensor = torch.tensor(text_indices, dtype=torch.long)
     embeddings = unique_embeddings[text_indices_tensor]
     print(f"  Computed {unique_count} embeddings via TextEmbedder")

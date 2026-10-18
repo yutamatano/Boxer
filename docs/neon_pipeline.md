@@ -24,6 +24,7 @@ python run_neon_pipeline.py \
 python view_tracker.py \
   --input sample_data/neon_Htou \
   --output_dir output/neon_Htou_run_01/viewer \
+  --require_gpu \
   --autoplay
 ```
 
@@ -33,7 +34,19 @@ python view_tracker.py \
 この環境での解析はGPUを必須とし、`--require_gpu` を指定します。
 CUDAを利用できなければ処理開始前に停止し、CPUへ自動で切り替えません。
 `run_boxer.py` 単体でも同じオプションを使えます。`--force_cpu` は指定しません。
+Viewerにも `--require_gpu` を指定します。CUDAとOpenGL描画の両方を確認し、
+`llvmpipe`などのCPU描画では停止します。LinuxではNVIDIA GLXオフロードを
+選択します（明示済みの環境変数は保持）。起動ログの `[GPU] OpenGL renderer:`
+で使用GPUを確認できます。
 区間ごとの融合も必要なら `--fuse` を追加します。
+
+特徴量キャッシュはCPU上の`float32`で保存し、OWLv2へ渡すときにだけ
+推論モデルの数値型へ変換します。対応GPUの`bfloat16`推論は継続します。
+Tracker・融合・Viewerでラベルを比較する特徴量は`float32`へ揃え、
+単位長に正規化します。既存の`bfloat16`キャッシュも読み込み時に変換するため、
+キャッシュ削除や解析のやり直しは不要です。CSVの小文字ラベル（例：`ipod`）も
+元のキャッシュキー（`iPod`）を利用できます。キャッシュにないラベルを新規計算
+した場合にも同じ数値型を使います。
 
 `--input neon_import_1` は `sample_data/neon_import_1` の直下にある単一の
 記録フォルダも解決します。複数の記録がある場合は対象フォルダを直接指定します。

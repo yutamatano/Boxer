@@ -8,6 +8,8 @@ import torch
 
 import run_boxer
 import run_neon_pipeline as pipeline
+import view_tracker
+from utils.viewer_3d import configure_gpu_viewer, validate_gpu_renderer
 
 
 @pytest.mark.parametrize("module", [run_boxer, pipeline])
@@ -45,3 +47,42 @@ def test_pipeline_forwards_gpu_requirement_to_all_intervals(tmp_path, monkeypatc
         "--require_gpu" in command and "--force_cpu" not in command
         for command in calls
     )
+
+
+def test_viewer_requires_cuda_before_loading_data(monkeypatch, capsys):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(sys, "argv", ["view_tracker.py", "--input", "missing", "--require_gpu"])
+    with pytest.raises(SystemExit) as exc:
+        view_tracker.main()
+    assert exc.value.code == 2
+    assert "CPU fallback is disabled" in capsys.readouterr().err
+
+
+def test_gpu_viewer_selects_nvidia_glx(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.delenv("__NV_PRIME_RENDER_OFFLOAD", raising=False)
+    monkeypatch.delenv("__GLX_VENDOR_LIBRARY_NAME", raising=False)
+    configure_gpu_viewer()
+    import os
+    assert os.environ["__NV_PRIME_RENDER_OFFLOAD"] == "1"
+    assert os.environ["__GLX_VENDOR_LIBRARY_NAME"] == "nvidia"
+
+
+@pytest.mark.parametrize("renderer", ["llvmpipe (LLVM 20)", "softpipe", "GDI Generic", ""])
+def test_gpu_viewer_rejects_software_gl(renderer):
+    with pytest.raises(RuntimeError, match="Hardware OpenGL is required"):
+        validate_gpu_renderer(SimpleNamespace(info={"GL_RENDERER": renderer}))
+
+
+def test_gpu_viewer_accepts_nvidia_gl():
+    validate_gpu_renderer(SimpleNamespace(info={"GL_RENDERER": "NVIDIA GeForce RTX 3070"}))
+
+
+def test_pipeline_viewer_command_keeps_gpu_requirement(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline, "run_boxer_segments", lambda *args: None)
+    monkeypatch.setattr(pipeline, "run_frame_estimates", lambda *args: None)
+    monkeypatch.setattr(pipeline, "assemble_replay", lambda *args: tmp_path / "viewer")
+    summary = {"recording": "recording"}
+    pipeline.run_inference(summary, tmp_path, SimpleNamespace(require_gpu=True))
+    assert "--require_gpu" in summary["viewer_command"]

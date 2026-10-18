@@ -146,7 +146,8 @@ class BoundingBox3DTracker:
             cached = _load_cached_text_embeddings()
             if cached is not None:
                 self._embedding_cache = {
-                    k: v / v.norm().clamp(min=1e-8) for k, v in cached.items()
+                    k: torch.nn.functional.normalize(v.float(), dim=-1)
+                    for k, v in cached.items()
                 }
             else:
                 # Fall back to loading TextEmbedder in background thread.
@@ -313,7 +314,9 @@ class BoundingBox3DTracker:
                     and t.cached_text != "?"
                 ]
                 if uncached:
-                    embs = self._embed_model.forward(uncached)
+                    embs = torch.nn.functional.normalize(
+                        self._embed_model.forward(uncached).float(), dim=-1
+                    )
                     for text, emb in zip(uncached, embs):
                         self._embedding_cache[text] = emb
             self._merge_duplicate_tracks(cam=cam, T_world_rig=T_world_rig)
@@ -369,7 +372,7 @@ class BoundingBox3DTracker:
                     from owl.clip_tokenizer import TextEmbedder
 
                     self._embed_model = TextEmbedder()
-            emb = self._embed_model.forward([text])[0]  # (embed_dim,)
+            emb = self._embed_model.forward([text])[0].float()  # (embed_dim,)
             emb = emb / emb.norm().clamp(min=1e-8)
             self._embedding_cache[text] = emb
         return self._embedding_cache[text]

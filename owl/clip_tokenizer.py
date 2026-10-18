@@ -211,4 +211,5 @@ class TextEmbedder:
         """
         tokens = self.tokenizer(texts)
         embeds = self.text_encoder(tokens["input_ids"], tokens["attention_mask"])
-        return F.normalize(embeds, dim=-1)
+        # Semantic consumers share float32 features regardless of detector precision.
+        return F.normalize(embeds.float(), dim=-1)

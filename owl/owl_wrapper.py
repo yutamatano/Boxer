@@ -277,10 +277,6 @@ class OwlWrapper(nn.Module):
             else:
                 # Old format: raw tensor
                 self.text_embeddings = cached
-            # Caches are shared across devices and precision settings.
-            self.text_embeddings = self.text_embeddings.to(
-                dtype=next(self.vision_detector.parameters()).dtype
-            )
             _dbg(f"load cached text embeddings ({len(text_prompts)} prompts)")
         else:
             self.text_embeddings = self._encode_text(text_prompts)
@@ -288,8 +284,12 @@ class OwlWrapper(nn.Module):
                 {"prompts": text_prompts, "embeddings": self.text_embeddings.cpu()},
                 cache_path,
             )
-            self.text_embeddings = self.text_embeddings.to(device)
             _dbg(f"encode_text ({len(text_prompts)} prompts) + save cache")
+        # Persist CPU float32 features; precision belongs to the consuming model.
+        # This also accepts old raw-tensor and bfloat16 cache files.
+        self.text_embeddings = self.text_embeddings.to(
+            device=device, dtype=next(self.vision_detector.parameters()).dtype
+        )
         self.query_mask = torch.ones(len(text_prompts), dtype=torch.bool, device=device)
 
         print(
@@ -302,21 +302,20 @@ class OwlWrapper(nn.Module):
             _dbg("warmup")
 
     def _encode_text(self, prompts):
-        """Tokenize and encode text prompts through the traced text encoder (runs on CPU)."""
+        """Return CPU float32 features for storage and subsequent device casting."""
         tokens = self.tokenizer(prompts)
         input_ids = tokens["input_ids"]  # CPU
         attention_mask = tokens["attention_mask"]  # CPU
         with torch.no_grad():
             embeds = self.text_encoder(input_ids, attention_mask)
-        embeds = embeds.to(self.device)
-        if self.use_bfloat16:
-            embeds = embeds.to(dtype=torch.bfloat16)
-        return embeds
+        return embeds.float().cpu()
 
     def set_text_prompts(self, prompts):
         """Update text prompts and re-compute cached embeddings."""
         self.text_prompts = prompts
-        self.text_embeddings = self._encode_text(prompts)
+        self.text_embeddings = self._encode_text(prompts).to(
+            device=self.device, dtype=next(self.vision_detector.parameters()).dtype
+        )
         self.query_mask = torch.ones(len(prompts), dtype=torch.bool, device=self.device)
 
     def _warmup(self, steps=1):

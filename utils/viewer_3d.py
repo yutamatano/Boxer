@@ -872,6 +872,27 @@ def load_common(args):
     return input_path, dataset_type, seq_name, log_dir, view_path, load_view_data
 
 
+def configure_gpu_viewer():
+    """Require CUDA and select NVIDIA GLX offload for Linux GUI windows."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is unavailable; CPU fallback is disabled")
+    if sys.platform.startswith("linux"):
+        os.environ.setdefault("__NV_PRIME_RENDER_OFFLOAD", "1")
+        os.environ.setdefault("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
+
+
+def validate_gpu_renderer(ctx):
+    """Reject software OpenGL even when CUDA itself is available."""
+    renderer = ctx.info.get("GL_RENDERER", "")
+    software = ("llvmpipe", "softpipe", "lavapipe", "swrast", "software", "gdi generic")
+    if not renderer or any(name in renderer.lower() for name in software):
+        raise RuntimeError(
+            f"Hardware OpenGL is required, but renderer is {renderer!r}; "
+            "software rendering is disabled. Check the display's NVIDIA GLX setup."
+        )
+    print(f"[GPU] OpenGL renderer: {renderer}", flush=True)
+
+
 def launch_viewer(ViewerClass):
     """Run moderngl viewer, protecting sys.argv."""
     saved_argv = sys.argv.copy()

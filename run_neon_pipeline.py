@@ -178,6 +178,8 @@ def run_inference(summary, out, args):
     viewer_output = assemble_replay(summary, out)
     command = [sys.executable, str(ROOT / "view_tracker.py"), "--input",
                summary["recording"], "--output_dir", str(viewer_output), "--autoplay"]
+    if getattr(args, "require_gpu", False):
+        command.append("--require_gpu")
     summary["viewer_command"] = command
     write_json(out / "pipeline.json", summary)
     print("Viewer:", shlex.join(command), flush=True)

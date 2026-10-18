@@ -15,11 +15,13 @@ from utils.viewer_3d import (
     TrackerViewer,
     add_common_args,
     build_seq_ctx,
+    configure_gpu_viewer,
     launch_viewer,
     load_common,
     resolve_bb2d_csv,
     scale_factor,
     subsample_timed_obbs,
+    validate_gpu_renderer,
 )
 
 
@@ -27,6 +29,7 @@ def main():
     # fmt: off
     parser = argparse.ArgumentParser(description="View BoxerNet results (tracker mode)")
     add_common_args(parser)
+    parser.add_argument("--require_gpu", action="store_true", help="Require CUDA and hardware OpenGL; select NVIDIA GLX offload on Linux")
     parser.add_argument("--init_follow", action="store_true", help="Initialize with Follow View enabled")
     parser.add_argument("--init_follow_behind", type=float, default=None, help="Follow-view behind distance (meters)")
     parser.add_argument("--init_follow_above", type=float, default=6.0, help="Follow-view above distance (meters)")
@@ -48,6 +51,11 @@ def main():
         help="Neon replay point cloud: auto if available, require on, or disable off",
     )
     args = parser.parse_args()
+    if args.require_gpu:
+        try:
+            configure_gpu_viewer()
+        except RuntimeError as exc:
+            parser.error(str(exc))
     if args.start_n < 0 or args.skip_n < 1 or args.max_n < 0:
         parser.error("Require start_n >= 0, skip_n >= 1 and max_n >= 0")
 
@@ -93,6 +101,8 @@ def main():
         window_size = (init_w, init_h)
 
         def __init__(self, **kw):
+            if args.require_gpu:
+                validate_gpu_renderer(kw["ctx"])
             super().__init__(
                 timed_obbs=timed_obbs,
                 root_path=log_dir,
