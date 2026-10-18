@@ -113,6 +113,7 @@ def main():
     points.add_argument("--point_cloud", choices=["auto", "on", "off"], default="auto", help="point input: auto uses available points, on requires them, off uses missing-depth inputs")
     points.add_argument("--no_sdp", dest="point_cloud", action="store_const", const="off", help="alias for --point_cloud off")
     parser.add_argument("--neon_geometry", type=str, help="Neon NPZ: timestamps_ns, T_world_camera, optional points_world (see README)")
+    parser.add_argument("--neon_imu_config", type=str, help="Prepared Neon manifest.json supplying image clock, IMU offset and camera-to-IMU calibration for local gravity")
     parser.add_argument("--neon_gaze", action="store_true", help="Export frame-sampled Neon gaze and overlay it on output images")
     parser.add_argument("--gaze_targets", action="store_true", help="Estimate gaze positions on current 3D box surfaces; enables --neon_gaze")
     parser.add_argument("--gaze_max_delta_ms", type=float, default=10., help="Maximum gaze-to-frame time difference in ms (default: 10)")
@@ -263,6 +264,7 @@ def main():
                 max_n=args.max_n, point_cloud=args.point_cloud,
                 geometry_path=args.neon_geometry,
                 gaze=args.neon_gaze, gaze_max_delta_ms=args.gaze_max_delta_ms,
+                imu_config_path=args.neon_imu_config,
             )
         except (ValueError, ImportError, OSError) as exc:
             parser.error(str(exc))

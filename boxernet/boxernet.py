@@ -258,7 +258,7 @@ def masked_median(x: torch.Tensor, mask: torch.Tensor, dim: int):
     return medians
 
 
-def sdp_to_patches(sdp_w, cam, T_wr, H, W, patch_size):
+def sdp_to_patches(sdp_w, cam, T_wr, H, W, patch_size, nearest_surface=False):
     """
     Convert semi-dense world points to a patch-based depth representation.
 
@@ -299,7 +299,8 @@ def sdp_to_patches(sdp_w, cam, T_wr, H, W, patch_size):
     depth_vals = sdp_c[..., 2].clone()
 
     # Build valid mask: must be valid projection with positive depth
-    valid_mask = valid & (depth_vals > 0)
+    valid_mask = (valid & (depth_vals > 0) & torch.isfinite(depth_vals)
+                  & torch.isfinite(sdp_uv).all(dim=-1))
 
     # Flatten for scatter operation
     bb = torch.arange(B, device=device).reshape(B, 1).expand(B, N)
@@ -313,16 +314,22 @@ def sdp_to_patches(sdp_w, cam, T_wr, H, W, patch_size):
 
     # Scatter depths and counts to image grid
     # Use index_add_ instead of scatter_reduce_ for MPS compatibility
-    sdp_img_flat = torch.zeros(B * H * W, device=device)
-    count_flat = torch.zeros(B * H * W, device=device)
-
-    sdp_img_flat.index_add_(0, valid_idx, valid_depth)
-    count_flat.index_add_(0, valid_idx, torch.ones_like(valid_depth))
-
-    # Compute mean depth per pixel
-    sdp_img = sdp_img_flat.reshape(B, 1, H, W)
-    count_img = count_flat.reshape(B, 1, H, W)
-    sdp_img = torch.where(count_img > 0, sdp_img / count_img, torch.zeros_like(sdp_img))
+    if nearest_surface:
+        # A registered map can contain foreground and occluded background at
+        # one pixel. Their mean is not a measured surface. Use a z-buffer before
+        # the existing per-patch averaging; retain legacy behavior for Aria.
+        sdp_img_flat = torch.full((B * H * W,), float("inf"), device=device)
+        sdp_img_flat.scatter_reduce_(0, valid_idx, valid_depth, reduce="amin", include_self=True)
+        sdp_img_flat = torch.where(torch.isfinite(sdp_img_flat), sdp_img_flat, 0.)
+        sdp_img = sdp_img_flat.reshape(B, 1, H, W)
+    else:
+        sdp_img_flat = torch.zeros(B * H * W, device=device)
+        count_flat = torch.zeros(B * H * W, device=device)
+        sdp_img_flat.index_add_(0, valid_idx, valid_depth)
+        count_flat.index_add_(0, valid_idx, torch.ones_like(valid_depth))
+        sdp_img = sdp_img_flat.reshape(B, 1, H, W)
+        count_img = count_flat.reshape(B, 1, H, W)
+        sdp_img = torch.where(count_img > 0, sdp_img / count_img, torch.zeros_like(sdp_img))
 
     # Convert to patches and compute median per patch
     sdp_patches = image_to_patches(
@@ -619,6 +626,9 @@ class BoxerNet(nn.Module):
         out["img0"] = img
         out["cam0"] = CameraTW(cam_data)
         out["T_world_rig0"] = PoseTW(T_wr_data)
+        if "T_world_voxel0" in datum:
+            voxel = datum["T_world_voxel0"]
+            out["T_world_voxel0"] = voxel.unsqueeze(0) if voxel.ndim == 1 else voxel
         return out
 
     def prepare_inputs(self, datum):
@@ -639,6 +649,8 @@ class BoxerNet(nn.Module):
 
         for key in inputs:
             inputs[key] = inputs[key].to(self.device).float()
+
+        inputs["nearest_surface_depth"] = bool(datum.get("nearest_surface_depth", False))
 
         return inputs
 
@@ -668,7 +680,10 @@ class BoxerNet(nn.Module):
 
             # Render semi-dense points as patches.
             sdp_w = batch["sdp_w_padded"]
-            sdp_median = sdp_to_patches(sdp_w, cam, T_wr, H, W, self.dino.patch_size)
+            sdp_median = sdp_to_patches(
+                sdp_w, cam, T_wr, H, W, self.dino.patch_size,
+                nearest_surface=batch.get("nearest_surface_depth", False),
+            )
             out["sdp_patch0"] = sdp_median.clone()
             sdp_input = sdp_median.reshape(B, -1, fH * fW).permute(0, 2, 1)
             x = torch.cat([dino_feat, sdp_input], dim=-1)

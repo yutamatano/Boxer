@@ -160,6 +160,17 @@ def assemble_replay(summary, out):
         ],
     )
     metadata["point_cloud"] = "per_segment"
+    metadata["local_gravity"] = {
+        "method": "per-part native IMU gravity; voxel tilt only; no position estimate",
+        "imu_frames": sum(part["metadata"].get("local_gravity", {}).get("imu_frames", 0)
+                          for part in parts),
+        "upright_fallback_frames": sum(
+            part["metadata"].get("local_gravity", {}).get(
+                "upright_fallback_frames",
+                len(part["times"]) if part["world_segment_id"] < 0 else 0,
+            ) for part in parts
+        ),
+    }
     if metadata.get("gaze"):
         metadata["gaze"]["world_frame"] = "world_z_up" if valid else None
     if metadata.get("gaze_targets"):

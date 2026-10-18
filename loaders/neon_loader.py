@@ -37,6 +37,9 @@ class NeonLoader(BaseLoader):
         gaze=False,
         gaze_max_delta_ms=10.,
         frame_ids=None,
+        imu_time_source="primary",
+        imu_offset_ms=0.,
+        imu_config_path=None,
     ):
         if start_n < 0 or skip_n < 1 or (max_n is not None and max_n < 1):
             raise ValueError("Require start_n >= 0, skip_n >= 1 and max_n >= 1")
@@ -52,6 +55,21 @@ class NeonLoader(BaseLoader):
             ) from exc
 
         self.root = Path(recording_dir).expanduser()
+        imu_config = {}
+        if imu_config_path is not None:
+            imu_config = json.loads(Path(imu_config_path).expanduser().read_text())
+            if (imu_config.get("recording") is not None
+                    and Path(imu_config["recording"]).resolve() != self.root.resolve()):
+                raise ValueError("IMU gravity configuration belongs to another recording")
+            imu_time_source = imu_config.get("image_clock", imu_time_source)
+            imu_offset_ms = imu_config.get("imu_offset_ms_applied", imu_offset_ms)
+        if imu_time_source not in ("primary", "aux") or not np.isfinite(imu_offset_ms):
+            raise ValueError("IMU gravity needs a primary/aux image clock and finite offset")
+        self.imu_config_path = str(Path(imu_config_path).resolve()) if imu_config_path else None
+        self.imu_extrinsics_source = (
+            "prepared camera-to-IMU calibration" if imu_config.get("T_imu_camera") is not None
+            else "manufacturer nominal scene-to-IMU rotation"
+        )
         self.recording = nr.open(self.root)
         self.index = 0
         # Start prefetch only after run_boxer has set the model's image size.
@@ -146,6 +164,31 @@ class NeonLoader(BaseLoader):
             )
             if self.has_world_poses and not self.world_pose_valid.all():
                 self.coordinate_frame = "mixed_world_and_per_frame"
+            self.local_gravity_camera = np.full((self.length, 3), np.nan)
+            self.imu_time_source = imu_time_source
+            self.imu_offset_ms = float(imu_offset_ms)
+            if not self.world_pose_valid.all():
+                from utils.neon_gravity import camera_gravity
+
+                try:
+                    imu = self.recording.imu[:]
+                except (AttributeError, nr.NeonRecording.SensorError) as exc:
+                    if any(self.root.glob("imu ps*.raw")) or any(self.root.glob("extimu ps*.raw")):
+                        raise ValueError("Native IMU data exists but could not be read for gravity") from exc
+                    imu = None
+                if imu is not None:
+                    image_times = (self.timestamps_ns if imu_time_source == "primary"
+                                   else self.aux_timestamps_ns)[self.frame_indices]
+                    shifted_imu_times = (np.asarray(imu.time, dtype=np.int64)
+                                         + np.int64(round(self.imu_offset_ms * 1e6)))
+                    self.local_gravity_camera = camera_gravity(
+                        image_times, shifted_imu_times, imu.rotation,
+                        T_imu_camera=imu_config.get("T_imu_camera"),
+                    )
+            self.local_gravity_valid = (
+                ~self.world_pose_valid & np.isfinite(self.local_gravity_camera).all(axis=1)
+                & (np.linalg.norm(self.local_gravity_camera[:, :2], axis=1) > 1e-6)
+            )
             self.gaze = None
             if gaze:
                 from utils.neon_gaze import NeonGaze
@@ -167,10 +210,11 @@ class NeonLoader(BaseLoader):
         )
         if not self.has_world_poses:
             print(
-                "==> No camera trajectory: per-frame 3D predictions assume an upright "
-                "camera; metric depth/size and gravity alignment are unverified. "
+                "==> No camera trajectory: predictions use independent local frames. "
+                "Native IMU tilt is used when available; metric depth/size remain unverified. "
                 "Tracking/fusion require registered camera poses."
             )
+        print(f"==> Native IMU gravity for local predictions: {self.local_gravity_valid.sum()} frames")
 
     @staticmethod
     def _read_times(path):
@@ -300,6 +344,7 @@ class NeonLoader(BaseLoader):
             "cam0": self._cam,
             "T_world_rig0": pose,
             "sdp_w": points,
+            "nearest_surface_depth": True,
             "observed_points": observed_points,
             "time_ns0": int(self.timestamps_ns[frame_index]),
             "frame_id": frame_index,
@@ -309,6 +354,17 @@ class NeonLoader(BaseLoader):
                 "world_z_up" if has_world_pose else "per_frame_assumed_upright"
             ),
         }
+        if self.local_gravity_valid[idx]:
+            from utils.gravity import gravity_align_T_world_cam
+
+            # Keep the existing camera-local CSV coordinates and zero position.
+            # Correct only the model's voxel up-axis: IMU tilt is not a world pose.
+            gravity_local = pose.R.numpy() @ self.local_gravity_camera[idx]
+            if np.linalg.norm(np.cross(pose.R.numpy()[:, 2], gravity_local)) > 1e-6:
+                datum["T_world_voxel0"] = gravity_align_T_world_cam(
+                    pose.unsqueeze(0), gravity_w=gravity_local.astype(np.float32),
+                    z_grav=True,
+                )[0]
         if self.gaze is not None:
             datum["gaze"] = self.gaze.sample(
                 frame_index, datum["time_ns0"], self.K, self.distortion, self._K_out,
@@ -328,6 +384,7 @@ class NeonLoader(BaseLoader):
             "depth_input": (
                 "external_metric_points" if self.use_points else "missing (-1)"
             ),
+            "depth_projection": "nearest positive camera-Z per pixel, then mean of valid pixels per patch",
             "timestamp_source": "Neon Scene Camera v1 ps*.time (int64 ns)",
             "images": "undistorted pinhole, resized; exported gaze uses the same transform",
             "image_size": self.resize,
@@ -340,6 +397,16 @@ class NeonLoader(BaseLoader):
                 "has_world_pose in the frame CSV; 0 = independent local 3D"
             ),
             "alignment": self.alignment_metadata,
+            "local_gravity": {
+                "method": "native IMU xyzw SLERP; voxel tilt only; no position or heading estimate",
+                "imu_frames": int(self.local_gravity_valid.sum()),
+                "upright_fallback_frames": int((~self.world_pose_valid & ~self.local_gravity_valid).sum()),
+                "image_clock": self.imu_time_source,
+                "imu_offset_ms": self.imu_offset_ms,
+                "max_interpolation_gap_ms": 50,
+                "extrinsics": self.imu_extrinsics_source,
+                "configuration": self.imu_config_path,
+            },
             "gaze": None if self.gaze is None else {
                 "sampling": "one nearest native binocular gaze sample per selected frame",
                 "max_delta_ns": self.gaze.max_delta_ns,

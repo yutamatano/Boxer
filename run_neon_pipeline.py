@@ -68,6 +68,14 @@ def run_logged(command, log, env=None, allowed=(0,), *, progress=None):
     return code
 
 
+def neon_imu_options(summary):
+    if "prepared" in summary:
+        manifest = Path(summary["prepared"]) / "manifest.json"
+        if manifest.is_file():
+            return ["--neon_imu_config", manifest]
+    return []
+
+
 def run_boxer_segments(summary, out, args):
     recording = Path(summary["recording"])
     completed = 0
@@ -101,7 +109,7 @@ def run_boxer_segments(summary, out, args):
             command += ["--require_gpu"]
         if getattr(args, "skip_viz", False):
             command += ["--skip_viz"]
-        command += gaze_options(args)
+        command += gaze_options(args) + neon_imu_options(summary)
         run_logged(command, out / f"boxer_{i:03d}.log", progress=StageProgress(
             out, "物体検出・3D推論", total, offset=completed,
             source="inference", detail=f"軌跡あり区間 {i + 1}/{len(summary['segments'])}",
@@ -177,7 +185,7 @@ def run_frame_estimates(summary, out, args):
             command += ["--require_gpu"]
         if getattr(args, "skip_viz", False):
             command += ["--skip_viz"]
-        command += gaze_options(args)
+        command += gaze_options(args) + neon_imu_options(summary)
         run_logged(command, out / f"frame_only_{i:03d}.log", progress=StageProgress(
             out, "物体検出・3D推論", len(frame_ids), offset=completed,
             source="inference", detail=f"軌跡なし区間 {i + 1}/{len(intervals)}",
