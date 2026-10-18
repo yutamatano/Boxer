@@ -134,7 +134,10 @@ def test_assembled_replay_preserves_all_frames_and_world_identity(replay):
         context["loader"].close()
 
 
-def test_headless_world_switch_never_combines_maps_or_tracks(replay, monkeypatch):
+@pytest.mark.parametrize("point_counts", [(3, 1), (1, 3), (1, 1)])
+def test_headless_world_switch_never_combines_maps_or_tracks(
+    replay, monkeypatch, point_counts
+):
     import moderngl_window as mglw
     from moderngl_window.context.headless import Window
     from moderngl_window.timers.clock import Timer
@@ -145,6 +148,14 @@ def test_headless_world_switch_never_combines_maps_or_tracks(replay, monkeypatch
     monkeypatch.setenv("MESA_SHADER_CACHE_DISABLE", "true")
     monkeypatch.setattr("utils.fuse_3d_boxes._load_cached_text_embeddings", lambda: {})
     root, times, summary, log = replay
+    for world, segment in enumerate(summary["segments"]):
+        path = Path(segment["geometry"])
+        with np.load(path) as geometry:
+            data = dict(geometry)
+        points = np.repeat(data["points_world"][:1], point_counts[world], axis=0)
+        points[:, 0] += np.arange(len(points)) * 0.1
+        data["points_world"] = points
+        np.savez(path, **data)
     context, timeline = build_neon_context(
         root, None, log, "boxer", read_obb_csv(log / "boxer_3dbbs.csv")
     )
@@ -168,6 +179,15 @@ def test_headless_world_switch_never_combines_maps_or_tracks(replay, monkeypatch
         viewer._reset_tracker()
         viewer.follow_view = True
         counts = {}
+
+        def check_point_cache(world):
+            positions = viewer._point_positions
+            assert len(positions) == point_counts[world]
+            np.testing.assert_allclose(viewer._pts_torch.numpy(), positions)
+            np.testing.assert_allclose(viewer._vertex_buf[:, :3], positions)
+            gpu_vertices = np.frombuffer(viewer.point_vbo.read(), dtype=np.float32)
+            np.testing.assert_allclose(gpu_vertices.reshape(-1, 6)[:, :3], positions)
+
         for i in range(5):
             viewer._step_to_frame(i)
             window.use()
@@ -184,8 +204,9 @@ def test_headless_world_switch_never_combines_maps_or_tracks(replay, monkeypatch
             tracks = viewer.tracker.get_all_tracks()
             assert len(tracks) == 1 and tracks[0].support_count == counts[world]
             assert viewer._active_neon_world_segment == world
-            assert viewer.point_count == 1
+            assert viewer.point_count == point_counts[world]
             assert viewer._point_positions[0, 0] == pytest.approx(2.0 + 100 * world)
+            check_point_cache(world)
             assert len(viewer._traj_all_segments) == 1
         if len(summary["segments"]) == 2:
             # Freeze cannot keep projecting the previous world's tracks.
@@ -194,6 +215,7 @@ def test_headless_world_switch_never_combines_maps_or_tracks(replay, monkeypatch
             assert viewer._active_neon_world_segment == 0
             assert not viewer.tracker.get_all_tracks()
             assert viewer._point_positions[0, 0] == 2.0
+            check_point_cache(0)
             viewer.freeze_tracker = False
             viewer._step_to_frame(2)
             assert viewer.tracker.get_all_tracks()[0].support_count == 1

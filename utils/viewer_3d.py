@@ -4951,6 +4951,9 @@ class TrackerViewer(SequenceOBBViewer):
                 setattr(self, name, None)
         had_points = self.point_count > 0
         self._point_positions = None
+        # CPU point caches belong to the previous world, just like its GL buffers.
+        self._pts_torch = None
+        self._vertex_buf = None
         self.point_count = self.point_inside_count = self.obs_point_count = 0
         self._uid_to_idx = {}
         self._time_to_uids_slaml = {}
