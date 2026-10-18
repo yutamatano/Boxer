@@ -23,7 +23,7 @@ def convert(
     trajectory,
     states,
     output,
-    min_frames=30,
+    min_frames=2,
     points=None,
     allow_partial=False,
 ):
@@ -262,7 +262,7 @@ def main():
     parser.add_argument("--trajectory", required=True)
     parser.add_argument("--states", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--min-frames", type=int, default=30)
+    parser.add_argument("--min-frames", type=int, default=2)
     parser.add_argument(
         "--points", help="Final map_points.csv from the same SLAM session"
     )

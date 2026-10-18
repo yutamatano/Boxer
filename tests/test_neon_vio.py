@@ -180,7 +180,8 @@ def test_conversion_excludes_uninitialized_and_lost_preserves_axes(
 ):
     prepared, trajectory, states, times, q = trajectory_fixture
     out = tmp_path / "converted"
-    report = convert(prepared, trajectory, states, out, min_frames=2)
+    report = convert(prepared, trajectory, states, out)
+    assert report["min_frames"] == 2
     assert [(s["start_n"], s["max_n"]) for s in report["segments"]] == [
         (11, 2),
         (14, 2),
@@ -197,6 +198,17 @@ def test_conversion_excludes_uninitialized_and_lost_preserves_axes(
             geo["T_world_camera"][0, :3, :3], Rotation.from_quat(q).as_matrix()
         )
         assert "points_world" not in geo
+
+
+def test_explicit_length_filter_still_excludes_short_valid_runs(
+    trajectory_fixture, tmp_path
+):
+    prepared, trajectory, states, _, _ = trajectory_fixture
+    with pytest.raises(ValueError, match="Longest valid continuous segment is 2 frames"):
+        convert(prepared, trajectory, states, tmp_path / "long_only", min_frames=30)
+    report = json.loads((tmp_path / "long_only/report.json").read_text())
+    assert report["metric_tracked_frames"] == 6
+    assert report["segments"] == []
 
 
 def test_conversion_refuses_duplicate_and_nonmetric(trajectory_fixture, tmp_path):

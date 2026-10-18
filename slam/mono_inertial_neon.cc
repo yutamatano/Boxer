@@ -13,6 +13,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include "neon_tracking_policy.h"
 
 namespace fs = std::filesystem;
 struct Frame { long id; double time; std::string image; };
@@ -104,6 +105,9 @@ int main(int argc, char** argv) {
             [](const Sample& sample, double time) { return sample.time < time; }) - imu.begin());
         if (next) --next; // The first image also needs an IMU sample before it.
         size_t metricOK = 0, processed = 0;
+        size_t recoveryAttempts = 0, recoveredEpisodes = 0, recoveryFrames = 0;
+        size_t firstLostIndex = 0;
+        bool recovering = false;
         bool stoppedOnLoss = false;
         const auto wallStart = std::chrono::steady_clock::now();
         for (size_t i = startIndex; i < frames.size(); ++i) {
@@ -134,12 +138,32 @@ int main(int argc, char** argv) {
             states.flush();
             metricOK += state == 2 && map.second;
             ++processed;
+            const bool resetPending = slam.NeonResetPending();
+            if (recovering && state == 2 && map.second) {
+                if (!resetPending) {
+                    ++recoveredEpisodes;
+                    std::cout << "Recovered metric tracking at source frame " << frame.id << std::endl;
+                }
+                recovering = false;
+            }
+            if (stopOnMetricLoss && metricOK && state == 3 && map.second && !resetPending) {
+                if (!recovering) {
+                    ++recoveryAttempts;
+                    firstLostIndex = i;
+                    std::cout << "Waiting for metric tracking recovery at source frame " << frame.id << std::endl;
+                }
+                recovering = true;
+                ++recoveryFrames;
+            }
             // The reset is executed at the beginning of the NEXT TrackMonocular.
             // Finalize while the initialized map and its optimized history exist.
+            // A transient loss alone is not a reset: let ORB's bounded recovery
+            // run. Never label its IMU-predicted frames as valid visual poses.
             if (stopOnMetricLoss && metricOK &&
-                (state != 2 || !map.second || slam.NeonResetPending())) {
+                neon::shouldFinalizeMetricMap(state, map.second, resetPending)) {
                 stoppedOnLoss = true;
-                std::cout << "Saving metric segment before reset at source frame " << frame.id << std::endl;
+                std::cout << "Saving metric segment before reset at source frame " << frame.id
+                          << " state=" << state << " reset_pending=" << resetPending << std::endl;
                 break;
             }
             if (i % 100 == 0) std::cout << "Neon frame " << i << '/' << frames.size() << " state=" << state << " mapped_features=" << mappedFeatures << " metric=" << map.second << std::endl;
@@ -147,11 +171,21 @@ int main(int argc, char** argv) {
         slam.Shutdown();
         const size_t finalMetric = slam.SaveNeonCameraTrajectory((output / "camera_trajectory.csv").string());
         const size_t points = slam.SaveNeonMapPoints((output / "map_points.csv").string());
+        const size_t nextIndex = neon::nextMetricSessionIndex(
+            startIndex + processed, recovering, firstLostIndex);
+        const size_t replayFrames = startIndex + processed - nextIndex;
+        if (replayFrames)
+            std::cout << "Recovery failed; retry " << replayFrames
+                      << " untracked images in the next session" << std::endl;
         std::ofstream summary(output / "run.json");
         summary << "{\"start_index\":" << startIndex
                 << ",\"processed_frames\":" << processed
-                << ",\"next_index\":" << startIndex + processed
+                << ",\"next_index\":" << nextIndex
                 << ",\"stopped_on_metric_loss\":" << (stoppedOnLoss ? "true" : "false")
+                << ",\"recovery_attempts\":" << recoveryAttempts
+                << ",\"recovered_episodes\":" << recoveredEpisodes
+                << ",\"recovery_frames\":" << recoveryFrames
+                << ",\"recovery_replay_frames\":" << replayFrames
                 << ",\"final_metric_poses\":" << finalMetric
                 << ",\"map_points\":" << points << "}\n";
         std::cout << "Final metric camera poses: " << finalMetric << "; runtime metric OK frames: " << metricOK << '/' << frames.size() << std::endl;

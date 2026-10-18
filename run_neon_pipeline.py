@@ -247,7 +247,10 @@ def main():
     parser.add_argument("--imu-noise")
     parser.add_argument("--experimental-noise", action="store_true")
     parser.add_argument("--extrinsics")
-    parser.add_argument("--min-frames", type=int, default=30)
+    parser.add_argument(
+        "--min-frames", type=int, default=2,
+        help="Minimum consecutive valid metric poses (default: 2; use 30 for the former length filter)",
+    )
     parser.add_argument("--pace", type=float, default=1.0)
     parser.add_argument("--labels", default="lvisplus")
     parser.add_argument("--force_cpu", action="store_true")
