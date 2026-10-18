@@ -71,6 +71,8 @@ def run_boxer_segments(summary, out, args):
         ]
         if args.force_cpu:
             command += ["--force_cpu"]
+        if getattr(args, "require_gpu", False):
+            command += ["--require_gpu"]
         if getattr(args, "skip_viz", False):
             command += ["--skip_viz"]
         command += gaze_options(args)
@@ -139,6 +141,8 @@ def run_frame_estimates(summary, out, args):
         ]
         if args.force_cpu:
             command += ["--force_cpu"]
+        if getattr(args, "require_gpu", False):
+            command += ["--require_gpu"]
         if getattr(args, "skip_viz", False):
             command += ["--skip_viz"]
         command += gaze_options(args)
@@ -202,6 +206,8 @@ def main():
     parser.add_argument("--pace", type=float, default=1.0)
     parser.add_argument("--labels", default="lvisplus")
     parser.add_argument("--force_cpu", action="store_true")
+    parser.add_argument("--require_gpu", action="store_true",
+                        help="Require CUDA for inference; disable CPU fallback")
     parser.add_argument("--skip_viz", action="store_true",
                         help="Skip inference JPEG/MP4 output; Viewer CSVs are still saved")
     parser.add_argument("--point_cloud", choices=["auto", "on", "off"], default="auto")
@@ -226,6 +232,12 @@ def main():
         help="Use pipeline.json in an existing output directory",
     )
     args = parser.parse_args()
+    if args.require_gpu:
+        if args.force_cpu:
+            parser.error("--require_gpu cannot be combined with --force_cpu")
+        import torch
+        if not torch.cuda.is_available():
+            parser.error("--require_gpu: CUDA is unavailable; CPU fallback is disabled")
     try:
         recording = recording_path(args.input)
         out = Path(args.output).expanduser().resolve()

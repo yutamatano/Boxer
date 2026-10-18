@@ -18,6 +18,7 @@ python run_neon_pipeline.py \
   --output output/neon_Htou_run_01 \
   --width 800 \
   --experimental-noise \
+  --require_gpu \
   --skip_viz
 
 python view_tracker.py \
@@ -29,7 +30,10 @@ python view_tracker.py \
 `--max_n` を省略すると記録全体（既定上限999999フレーム）を処理します。
 動作確認なら `--max_n 30` などで入力範囲を限定できます。
 `--skip_viz` は推論時のJPEG/MP4生成を省略し、Viewer用のCSVは保存します。
-CPUを明示する場合は `--force_cpu`、区間ごとの融合も必要なら `--fuse` を追加します。
+この環境での解析はGPUを必須とし、`--require_gpu` を指定します。
+CUDAを利用できなければ処理開始前に停止し、CPUへ自動で切り替えません。
+`run_boxer.py` 単体でも同じオプションを使えます。`--force_cpu` は指定しません。
+区間ごとの融合も必要なら `--fuse` を追加します。
 
 `--input neon_import_1` は `sample_data/neon_import_1` の直下にある単一の
 記録フォルダも解決します。複数の記録がある場合は対象フォルダを直接指定します。
@@ -46,7 +50,7 @@ neon_Htouなど別の記録へ自動で引き継ぎません。
 
 ```bash
 python run_neon_pipeline.py --input sample_data/neon_Htou \
-  --output output/neon_Htou_run_01 --boxer-only --skip_viz
+  --output output/neon_Htou_run_01 --boxer-only --require_gpu --skip_viz
 ```
 
 `--prepared PATH` を指定すると既存の前処理を再利用します。その場合、

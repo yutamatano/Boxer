@@ -118,6 +118,7 @@ def main():
     parser.add_argument("--gaze_max_delta_ms", type=float, default=10., help="Maximum gaze-to-frame time difference in ms (default: 10)")
     parser.add_argument("--no_csv", action="store_true", help="skip CSV writing")
     parser.add_argument("--force_cpu", action="store_true", help="force CPU")
+    parser.add_argument("--require_gpu", action="store_true", help="require CUDA; stop instead of falling back to CPU")
     parser.add_argument("--gt2d", action="store_true", help="use GT pseudo 2DBB as input")
     parser.add_argument("--fuse", action="store_true", help="run offline 3D box fusion after processing")
     parser.add_argument("--track", action="store_true", help="run online 3D box tracking and show tracked boxes in Top Down View")
@@ -125,6 +126,11 @@ def main():
     parser.add_argument("--force_precision", type=str, default=None, choices=["float32", "bfloat16"], help="Override auto-detected inference precision")
     parser.add_argument("--output_dir", type=str, default=EVAL_PATH, help="Output directory for results (default: output/)")
     args = parser.parse_args()
+    if args.require_gpu:
+        if args.force_cpu:
+            parser.error("--require_gpu cannot be combined with --force_cpu")
+        if not torch.cuda.is_available():
+            parser.error("--require_gpu: CUDA is unavailable; CPU fallback is disabled")
     if args.gaze_targets:
         args.neon_gaze = True
 
@@ -318,7 +324,9 @@ def main():
     _dbg("loader")
 
     # choose a model checkpoint
-    if torch.backends.mps.is_available() and not args.force_cpu:
+    if args.require_gpu:
+        device = "cuda"
+    elif torch.backends.mps.is_available() and not args.force_cpu:
         device = "mps"
     elif torch.cuda.is_available() and not args.force_cpu:
         device = "cuda"
