@@ -1,5 +1,6 @@
 #include "imu_snapshot.h"
 #include "diagnostics.h"
+#include "imu_replay_trace.h"
 #include "Thirdparty/g2o/g2o/core/block_solver.h"
 #include "KeyFrame.h"
 #include <boost/property_tree/json_parser.hpp>
@@ -22,6 +23,20 @@ public:
     void linearizeOplus() override {
         EdgeInertialGS::linearizeOplus();
         _jacobianOplus[7]*=static_cast<const VertexScale*>(_vertices[7])->estimate();
+    }
+};
+// Same native manifold update, independently differentiated scale column.
+class NumericScaleEdge : public EdgeInertialGS {
+public:
+    explicit NumericScaleEdge(IMU::Preintegrated* p):EdgeInertialGS(p) {}
+    void linearizeOplus() override {
+        EdgeInertialGS::linearizeOplus();
+        auto scale=static_cast<VertexScale*>(_vertices[7]);
+        const double original=scale->estimate(), eps=1e-6;
+        scale->setEstimate(original*std::exp(eps));computeError();const auto plus=_error;
+        scale->setEstimate(original*std::exp(-eps));computeError();const auto minus=_error;
+        scale->setEstimate(original);computeError();
+        _jacobianOplus[7]=(plus-minus)/(2*eps);
     }
 };
 std::atomic<unsigned long> serial{0};
@@ -104,14 +119,26 @@ void MapCheckpoint(Map* map,const std::string& stage) {
     for(auto k:map->GetAllKeyFrames()) {ptree p;p.put("kf_id",k->mnId);p.put("source_frame_id",Source(k->mTimeStamp));p.add_child("camera_center",matrix(k->GetCameraCenter()));ks.push_back({"",p});}
     data.add_child("keyframes",ks);boost::property_tree::write_json(last_snapshot+"."+stage+".json",data);
 }
-int ReplayImu(const std::string& input,const std::string& output,bool correct_scale_jacobian) {
+int ReplayImu(const std::string& input,const std::string& output,bool correct_scale_jacobian,bool numeric_scale_jacobian,const std::string& warm_start,bool tracing) {
     ptree data;boost::property_tree::read_json(input,data);if(data.get<int>("schema")!=1)throw std::runtime_error("Snapshot schema");
     // Preintegrations outlive the optimizer edges that refer to them.
     std::vector<std::unique_ptr<IMU::Preintegrated>> ints;
     g2o::SparseOptimizer o;
-    auto solver=new g2o::OptimizationAlgorithmLevenberg(new g2o::BlockSolverX(new g2o::LinearSolverEigen<g2o::BlockSolverX::PoseMatrixType>()));
+    auto block=new g2o::BlockSolverX(new g2o::LinearSolverEigen<g2o::BlockSolverX::PoseMatrixType>());
+    g2o::OptimizationAlgorithmLevenberg* solver=tracing ? new ReplayLevenberg(block) : new g2o::OptimizationAlgorithmLevenberg(block);
     if(data.get<double>("lambda_init")>0)solver->setUserLambdaInit(data.get<double>("lambda_init"));o.setAlgorithm(solver);
-    for(auto& item:data.get_child("vertices_insertion_order")) {auto& p=item.second;auto type=p.get<std::string>("type");g2o::OptimizableGraph::Vertex* v=nullptr;
+    ptree warm;
+    if(!warm_start.empty())boost::property_tree::read_json(warm_start,warm);
+    for(auto& item:data.get_child("vertices_insertion_order")) {auto p=item.second;
+        if(!warm.empty() && !p.get<bool>("fixed")) {
+            bool found=false;
+            for(const auto& candidate:warm.get_child("vertices"))if(candidate.second.get<int>("id")==p.get<int>("id")) {
+                if(candidate.second.get<std::string>("type")!=p.get<std::string>("type"))throw std::runtime_error("Warm-start vertex type mismatch");
+                p=candidate.second;found=true;break;
+            }
+            if(!found)throw std::runtime_error("Missing warm-start vertex");
+        }
+        auto type=p.get<std::string>("type");g2o::OptimizableGraph::Vertex* v=nullptr;
         if(type=="pose") {auto x=new VertexPose;ImuCamPose pose;load(p.get_child("Rwb"),pose.Rwb);load(p.get_child("twb"),pose.twb);x->setEstimate(pose);v=x;}
 #define LOAD_VEC(t, cls) else if(type==t) {auto x=new cls;Eigen::Vector3d a;load(p.get_child("value"),a);x->setEstimate(a);v=x;}
         LOAD_VEC("velocity",VertexVelocity) LOAD_VEC("gyro",VertexGyroBias) LOAD_VEC("accel",VertexAccBias)
@@ -128,7 +155,7 @@ int ReplayImu(const std::string& input,const std::string& output,bool correct_sc
 #define READ_CACHED(f) load(p.get_child("cached_" #f),in->f)
             READ_CACHED(JRg);READ_CACHED(JVg);READ_CACHED(JPg);READ_CACHED(JVa);READ_CACHED(JPa);
 #undef READ_CACHED
-            EdgeInertialGS* x=correct_scale_jacobian ? static_cast<EdgeInertialGS*>(new CorrectScaleEdge(in.get())) : new EdgeInertialGS(in.get());Eigen::Matrix<double,9,9> info;load(p.get_child("information"),info);x->setInformation(info);load(p.get_child("gravity_vector"),x->gI);e=x;
+            EdgeInertialGS* x=numeric_scale_jacobian ? static_cast<EdgeInertialGS*>(new NumericScaleEdge(in.get())) : correct_scale_jacobian ? static_cast<EdgeInertialGS*>(new CorrectScaleEdge(in.get())) : new EdgeInertialGS(in.get());Eigen::Matrix<double,9,9> info;load(p.get_child("information"),info);x->setInformation(info);load(p.get_child("gravity_vector"),x->gI);e=x;
             in->dT=p.get<float>("preintegration_dt");
 #define READ_FIELD(f) load(p.get_child(#f),in->f)
             READ_FIELD(JRg);READ_FIELD(JVg);READ_FIELD(JPg);READ_FIELD(JVa);READ_FIELD(JPa);
@@ -139,6 +166,7 @@ int ReplayImu(const std::string& input,const std::string& output,bool correct_sc
             else if(type=="prior_gyro") {auto x=new EdgePriorGyro(b);x->setInformation(info);e=x;}else throw std::runtime_error("Unknown snapshot edge");}
         size_t i=0;for(auto& id:p.get_child("vertices")){auto v=o.vertex(id.second.get_value<int>());if(!v)throw std::runtime_error("Missing snapshot vertex");e->setVertex(i++,v);}if(!o.addEdge(e))throw std::runtime_error("Invalid snapshot edge");
     }
-    o.setVerbose(false);o.initializeOptimization();o.optimize(data.get<int>("iterations"));ptree r=result(o);r.put("scale_jacobian",correct_scale_jacobian?"chain_rule_corrected_replay_only":"upstream");boost::property_tree::write_json(output,r);return 0;
+    o.setVerbose(false);o.initializeOptimization();const int actual=o.optimize(data.get<int>("iterations"));ptree r=result(o);r.put("iterations_actual",actual);r.put("warm_start",warm_start);
+    if(tracing){r.add_child("iteration_trace",static_cast<ReplayLevenberg*>(solver)->trace);r.put("final_numeric_gradient_l2",NumericGradientNorm(o));}r.put("scale_jacobian",numeric_scale_jacobian?"numeric_scale_column_replay_only":correct_scale_jacobian?"chain_rule_corrected_replay_only":"upstream");boost::property_tree::write_json(output,r);return 0;
 }
 }

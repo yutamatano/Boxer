@@ -9,8 +9,37 @@ def replace(text, old, new, count=1):
     return text.replace(old, new)
 
 
+
+def visual_optimizer(text):
+    import re
+    scopes=[('void Optimizer::BundleAdjustment(', 'global_visual_ba', 'nIterations', '-1', 'visualTime'),
+            ('void Optimizer::LocalBundleAdjustment(KeyFrame *pKF,', 'local_visual_ba', '10', 'pMap->IsInertial()?100.:-1.', 'pKF->mTimeStamp')]
+    for signature,stage,iterations,initial_lambda,timestamp in scopes:
+        begin=text.index(signature);end=text.index('\nvoid Optimizer::',begin+10)
+        part=text[begin:end]
+        brace=part.index('\n{')+2
+        declaration='\n    neon_diag::VisualSnapshot visualSnapshot;\n'
+        if stage=='global_visual_ba':declaration+='    double visualTime=0; for(auto k:vpKFs) visualTime=std::max(visualTime,k->mTimeStamp);\n'
+        part=part[:brace]+declaration+part[brace:]
+        part=re.sub(r'optimizer.addVertex\((\w+)\);',r'optimizer.addVertex(\1); visualSnapshot.Vertex(\1);',part)
+        part=re.sub(r'optimizer.addEdge\((\w+)\);',r'optimizer.addEdge(\1); visualSnapshot.Edge(\1);',part)
+        part=replace(part,'optimizer.initializeOptimization();',
+            f'visualSnapshot.Capture(optimizer,pMap,{timestamp},"{stage}",{iterations},{initial_lambda},pbStopFlag && *pbStopFlag);\n    optimizer.initializeOptimization();')
+        part=replace(part,f'optimizer.optimize({iterations});',f'int visualActualIterations=optimizer.optimize({iterations});\n    visualSnapshot.Result(optimizer,visualActualIterations,pbStopFlag && *pbStopFlag);')
+        text=text[:begin]+part+text[end:]
+    begin=text.index('int Optimizer::PoseOptimization(Frame *pFrame)');end=text.index('\nvoid Optimizer::',begin+10)
+    part=text[begin:end];brace=part.index('\n{')+2
+    part=part[:brace]+"""
+    neon_diag::VisualFrame(pFrame,"tracking_pose_before");
+    neon_diag::Finally visualFrameResult([pFrame]{neon_diag::VisualFrame(pFrame,"tracking_pose_after");});
+"""+part[brace:]
+    return text[:begin]+part+text[end:]
+
+
 def instrument(name, text):
     text = '#include "diagnostics.h"\n' + text
+    if name in ['Tracking','LocalMapping','Optimizer']:
+        text='#include "visual_snapshot.h"\n'+text
     if name == 'Tracking':
         text = replace(text, 'void Tracking::Track()\n{', '''void Tracking::Track()
 {
@@ -47,7 +76,11 @@ def instrument(name, text):
         {
             diagnostic.record.result="MATCHES_LOW";''')
         part=replace(part,'CreateInitialMapMonocular();','diagnostic.record.result="VISUAL_INITIALIZED";\n            CreateInitialMapMonocular();')
+        part=replace(part,'mCurrentFrame.SetPose(Tcw);', 'mCurrentFrame.SetPose(Tcw);\n            neon_diag::VisualInitial(mpAtlas->GetCurrentMap(),mInitialFrame.mTimeStamp,mCurrentFrame.mTimeStamp,Tcw,mvIniMatches,mvIniP3D);')
         text=text[:begin]+part+text[end:]
+        text=replace(text,'Optimizer::GlobalBundleAdjustemnt(mpAtlas->GetCurrentMap(),20);', 'neon_diag::VisualMap(mpAtlas->GetCurrentMap(),"initial_ba_before",mCurrentFrame.mTimeStamp);\n    Optimizer::GlobalBundleAdjustemnt(mpAtlas->GetCurrentMap(),20);\n    neon_diag::VisualMap(mpAtlas->GetCurrentMap(),"initial_ba_after",mCurrentFrame.mTimeStamp);')
+        text=replace(text,'// Scale initial baseline', 'neon_diag::VisualMap(mpAtlas->GetCurrentMap(),"normalization_before",mCurrentFrame.mTimeStamp);\n    // Scale initial baseline')
+        text=replace(text,'pKFcur->mPrevKF = pKFini;', 'neon_diag::VisualMap(mpAtlas->GetCurrentMap(),"normalization_after",mCurrentFrame.mTimeStamp);\n        pKFcur->mPrevKF = pKFini;')
         text=replace(text,'Verbose::PrintMess("Wrong initialization, reseting...", Verbose::VERBOSITY_QUIET);',
                      'neon_diag::InitResult("POST_BA_FAILED");\n        Verbose::PrintMess("Wrong initialization, reseting...", Verbose::VERBOSITY_QUIET);')
         text=replace(text,'mpAtlas->clearMap();',
@@ -102,6 +135,7 @@ def instrument(name, text):
         part=replace(part,'optimizer.setVerbose(false);', 'diagnosticSnapshot.Capture(vpKFs,pMap->GetId(),maxKFid,its,priorG,priorA,bMono,bFixedVel,bGauss);\n    optimizer.setVerbose(false);')
         part=replace(part,'optimizer.optimize(its);','optimizer.optimize(its);\n    diagnosticSnapshot.Result(optimizer);')
         text=text[:begin]+part+text[end:]
+        text=visual_optimizer(text)
     elif name == 'System':
         text=replace(text,'''void System::ResetActiveMap()
 {
@@ -115,6 +149,27 @@ def instrument(name, text):
         text=replace(text,'mspMaps.insert(mpCurrentMap);', 'mspMaps.insert(mpCurrentMap);\n    neon_diag::Event("MAP_CREATED",mpCurrentMap->GetId());')
         text=replace(text,'mpCurrentMap = pMap;', 'mpCurrentMap = pMap;\n    neon_diag::Event("MAP_CHANGED",pMap->GetId());')
     elif name == 'LocalMapping':
+        begin=text.index('void LocalMapping::SearchInNeighbors()');end=text.index('\nvoid LocalMapping::',begin+10)
+        part=text[begin:end]
+        part=replace(part,'if (mbAbortBA)\n        return;',"""if (mbAbortBA) {
+        if(neon_diag::VisualEnabled(mpCurrentKeyFrame->GetMap(),mpCurrentKeyFrame->mTimeStamp))
+            neon_diag::Event("FUSION_ABORT_AFTER_FORWARD",mpCurrentKeyFrame->GetMap()->GetId(),mpCurrentKeyFrame->mTimeStamp);
+        return;
+    }
+    if(neon_diag::VisualEnabled(mpCurrentKeyFrame->GetMap(),mpCurrentKeyFrame->mTimeStamp))
+        neon_diag::Event("FUSION_BACKWARD_BEGIN",mpCurrentKeyFrame->GetMap()->GetId(),mpCurrentKeyFrame->mTimeStamp);""")
+        text=text[:begin]+part+text[end:]
+        begin=text.index('void LocalMapping::Run()');end=text.index('\nvoid LocalMapping::',begin+10)
+        part=text[begin:end]
+        for method in ['MapPointCulling','CreateNewMapPoints','SearchInNeighbors','KeyFrameCulling']:
+            call=method+'();'
+            before=f'neon_diag::VisualMap(mpCurrentKeyFrame->GetMap(),"{method}_before",mpCurrentKeyFrame->mTimeStamp);'
+            after=f'neon_diag::VisualMap(mpCurrentKeyFrame->GetMap(),"{method}_after",mpCurrentKeyFrame->mTimeStamp);'
+            part=replace(part,call,'{ '+before+' '+call+' '+after+' }')
+        part=replace(part,'ProcessNewKeyFrame();', 'ProcessNewKeyFrame();\n            neon_diag::VisualMap(mpCurrentKeyFrame->GetMap(),"ProcessNewKeyFrame_after",mpCurrentKeyFrame->mTimeStamp);')
+        call='Optimizer::LocalBundleAdjustment(mpCurrentKeyFrame,&mbAbortBA, mpCurrentKeyFrame->GetMap(),num_FixedKF_BA,num_OptKF_BA,num_MPs_BA,num_edges_BA);'
+        part=replace(part,call,call+'\n                        neon_diag::VisualMap(mpCurrentKeyFrame->GetMap(),"local_ba_map_after",mpCurrentKeyFrame->mTimeStamp);')
+        text=text[:begin]+part+text[end:]
         text = '#include "imu_snapshot.h"\n' + text
         text=replace(text,'mpAtlas->GetCurrentMap()->ApplyScaledRotation(Twg, mScale, true);',
             'mpAtlas->GetCurrentMap()->ApplyScaledRotation(Twg, mScale, true);\n            neon_diag::MapCheckpoint(mpAtlas->GetCurrentMap(),"after_scale");')

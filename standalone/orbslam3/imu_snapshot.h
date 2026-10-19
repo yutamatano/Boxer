@@ -16,7 +16,8 @@ struct ImuSnapshot {
     void Result(g2o::SparseOptimizer& optimizer);
 };
 void MapCheckpoint(ORB_SLAM3::Map* map, const std::string& stage);
-int ReplayImu(const std::string& input, const std::string& output, bool correct_scale_jacobian=false);
+int ReplayImu(const std::string& input, const std::string& output, bool correct_scale_jacobian=false, bool numeric_scale_jacobian=false,
+              const std::string& warm_start="", bool trace=false);
 std::string SnapshotDirectory();
 unsigned long MapEpoch(long map);
 }

@@ -403,3 +403,178 @@ The replay-only Jacobian correction reduced stable-input chi2 from 29942.19 to
 It is consequently retained as a separately labelled experiment; the live
 upstream estimator is unchanged. A mathematically consistent derivative alone
 has not been shown to solve the observed initialization instability.
+
+### Independent multi-view visual reconstruction
+
+`neon_sfm.py` evaluates actual shared-point reconstruction, independently of
+Boxer's metric pipeline. It requires the above LightGlue runtime and the earlier
+`neon_Htou_lightglue_audit_01/results.csv` for the **predeclared** case and seed
+selection rules. The optional COLMAP wheel lives outside the application venv:
+
+```bash
+uv --cache-dir output/neon_sfm_runtime/uv-cache pip install \
+  --python .venv/bin/python --target output/neon_sfm_runtime/deps \
+  --no-deps pycolmap-cuda12==4.2.1
+.venv/bin/python standalone/orbslam3/neon_sfm.py \
+  --prepared output/neon_Htou_standalone_03/prepared \
+  --output output/neon_Htou_learned_sfm_01
+```
+
+The default experiment covers **every image from 25834 through 26733**. Stages
+`extract`, `match`, `triplets`, `database`, and `reconstruct` can be run separately;
+`--resume` requires identical source IDs, original nanosecond timestamps and
+calibration identity. Learned inference requires CUDA and Float32. The pinned
+CUDA COLMAP wheel's Ceres build lacks a CUDA BA solver; BA and classical geometry
+explicitly use CPU, rather than silently falling back from a GPU request.
+
+Correspondences use offsets 1/2/3/5. Three fixed groups each contain the first five
+distinct references satisfying the previous adjacent-pass, delayed-rescue or
+failed-gate condition. Each case triangulates two views, estimates camera 3 by
+PnP, runs joint 3-view BA, estimates camera 4 against the **same** updated 3D
+points, then runs joint 4-view BA. Failures remain in `triplets/results.json`.
+Essential-matrix cheirality alternatives, homography support and point planarity
+are diagnostic fields, not proof of unique geometry. All BA intrinsics stay fixed.
+
+The default pipeline then reconstructs 40 contiguous images and all 900 images
+with COLMAP. It does not concatenate independently normalized relative motions.
+For seed sensitivity, compare **identical single-map settings**:
+
+```bash
+.venv/bin/python standalone/orbslam3/neon_sfm.py \
+  --prepared output/neon_Htou_standalone_03/prepared \
+  --output output/neon_Htou_learned_sfm_01 --resume \
+  --stage reconstruct --single-map --seed-policy earliest
+```
+
+Repeat that comparison with `auto` and `most_points`. `earliest` selects the first
+previously passing pair within the first 60 references; `most_points` maximizes
+its triangulated count in the same candidate set, with source-ID tie breaks.
+Forced seeds require `--single-map`: otherwise COLMAP can keep trying to reuse
+that initial pair when starting later models. An interrupted preflight exercising
+that behavior was retained and excluded, not counted as a completed experiment.
+
+Each model has a quality report and an explicitly **nonmetric** pose export.
+COLMAP camera-from-world poses are inverted. `visual_trajectory.npz` stores
+original `int64` source IDs/timestamps, 3x4 camera-to-world matrices and
+`metric=False`; it deliberately does not emit a Boxer `pipeline.json` or a metric
+geometry NPZ. Feature coordinates **and** principal point both move by +0.5px
+exactly once, preserving the OpenCV normalized rays. Independent maps are not
+aligned; the sum of model sizes may double-count overlapping frames. Reports
+therefore separate unique registered frames, largest map, contiguous spans,
+holes, point track lengths, observation reprojection errors and negative depth.
+This offline method uses future images and is not an online SLAM accuracy test.
+
+### Visual graph and descriptor replay
+
+```bash
+output/orbslam3_standalone/.venv/bin/python standalone/orbslam3/run.py \
+  --prepared output/neon_Htou_standalone_03/prepared \
+  --output output/visual_capture_example --start_n 9988 --max_n 65 \
+  --pace 1 --diagnostics --imu-snapshots --visual-snapshots \
+  --visual-max-source 10025
+LD_LIBRARY_PATH="$PWD/output/orbslam3_standalone/prefix/lib" \
+  output/orbslam3_standalone/build_diagnostics/replay_visual_ba \
+  SNAPSHOT.json REPLAY.json
+.venv/bin/python standalone/orbslam3/compare_visual_maps.py \
+  RUN_A/slam RUN_B/slam --output COMPARISON.json
+```
+
+Visual snapshots default off. They cover initial two-view geometry, initial BA
+and normalization, point culling/creation/fusion, KF culling, tracking pose
+optimization, actual visual BA graph input/result and separate map writeback.
+Collection stops after IMU initialization, a reset epoch, or the explicit source
+limit. Synchronous observation changes scheduling and allocation; capture runs
+are diagnostic evidence, not an unbiased latency/coverage benchmark.
+
+Map snapshots also preserve representative ORB descriptors, normals, distance
+limits, ordered covisibility neighbors and feature-to-point slots. Points are
+matched across runs through shared `(source frame, feature index)` observations,
+never by native MapPoint ID alone. Sim(3) comparison uses shared points and camera
+centres and reports relative rotation separately. An existing single-pose scale
+gauge is recorded, not assumed to explain every deformation.
+
+Visual replay restores exact stored quaternion coefficients, graph insertion
+order, fixed/marginalized variables, pinhole intrinsics, information matrices,
+Huber kernels and actual iteration count. Cached errors are observed without
+recomputing them in live BA: recomputing could change native outlier removal.
+Detached analysis separately recomputes the objective. Abort-interrupted graphs
+may depend on the inner stopping instant; exact replay is checked on completed
+graphs. The optional replay-only `--anchor-scale` adds one scalar log-baseline
+residual, not a fixed second pose. It has a synthetic gauge regression test; it
+was **not** applied as a real-data fix because the first observed inputs already
+contained different descriptor choices/observations.
+
+`replay_point_descriptors.py SNAPSHOT --features FEATURES.bin ... --output RESULT`
+reconstructs upstream Hamming medoid selection from saved native keyframe
+features and the snapshot's original observation order. A separate canonical
+source/feature order is only a diagnostic control. It does not modify live SLAM.
+
+### Scale Jacobian numerical reference and convergence
+
+```bash
+LD_LIBRARY_PATH="$PWD/output/orbslam3_standalone/prefix/lib" \
+  output/orbslam3_standalone/build_diagnostics/replay_imu_initialization \
+  SNAPSHOT.json RESULT.json --numeric-scale-jacobian --trace
+```
+
+Compare this with `--correct-scale-jacobian` and neither flag. `--warm-start
+NATIVE_RESULT.json` initializes free variables at the native final solution;
+fixed poses and graph constraints stay unchanged. Include a native-Jacobian
+warm-start control because restarting also resets damping. `--trace` records
+outer-iteration objective values, actual accepted/attempted step norms, inner
+rejection counts, damping, numerical tangent-space gradient norm and termination
+status. Gradient norms mix parameter units and are not a metric accuracy score.
+The numerical reference replaces **only** the scale column with central
+differences of `s*exp(delta)` at epsilon 1e-6. All conditions remain replay-only.
+
+### Recorded 2026-10-20 experiment
+
+- Four-view reconstruction passed 2/5 adjacent cases, 3/5 delayed-rescue cases,
+  and 1/5 previously failed-gate cases. All 40 contiguous images registered in
+  one map. The 900-image automatic multi-map run registered **883/900 unique
+  images (98.11%)**, across **11 maps**; its largest single map was **266/900
+  (29.56%)**, continuously spanning **26176–26441**. Mapping took 294.2s, excluding
+  feature extraction/matching. These are arbitrary-scale registration figures,
+  not metric coverage or independent accuracy measurements.
+- Identical single-map seed comparisons registered **3, 204, 204** images for
+  automatic, earliest and most-triangulated selection. The automatic 3-image,
+  3-point model is an unusable small reconstruction despite its low residual.
+  Seed sensitivity is substantial. The automatic multi-map total must not be
+  presented as a 98% single-world result.
+- Visual capture cohort 1 recorded an early reset in trial 5. Initial geometry,
+  initial BA and normalization were identical; first recorded observation
+  differences occurred in neighbor fusion at source 10004. Local BA input had
+  1111 versus 1092 observations. Cohort 2 added descriptor/neighbor observations:
+  all 20 short prefixes avoided the early reset, illustrating observer effects.
+  In trials 1 and 3 its **first saved state difference** was descriptor/normal
+  recomputation during `ProcessNewKeyFrame` at **10004**: 48/283 descriptors
+  differed while point geometry and observation sets still matched. Native
+  descriptor replay matched **283/283 in both runs**; all 48 differing choices
+  were tied medoid minima resolved by native pointer order. Canonical source
+  ordering made all 48 identical in the detached control. Subsequent fusion
+  changed constraints, and first local BA changed shape (about 1.94% normalized
+  point RMS after Sim(3)), not just uniform scale. This proves an input-variation
+  mechanism; it does not prove that descriptor ties alone caused the original
+  full-recording failure. No live matching/BA algorithm was changed.
+- Initial and first local visual BA inputs each replayed five times exactly
+  (all saved estimates: max difference **0**) for both selected runs. The
+  corrected IMU scale derivative agreed with the numerical-column reference:
+  scale differences below 1e-8 and objective differences below 1.6e-7. Actual
+  native/corrected iteration counts were **9/8** for the stable input and **7/4**
+  for the early-reset input, despite a requested limit of 200. The early case
+  hit the upstream three-small-improvements rule; other conditions hit the
+  ten-inner-trials limit. Warm-start comparisons and full traces were retained.
+  Correct differentiation is verified; general convergence and metric accuracy
+  remain unproven, so the production estimator is unchanged.
+
+Local artifacts: `output/neon_Htou_learned_sfm_01/`,
+`output/neon_Htou_visual_audit_01/`, `output/neon_Htou_visual_audit_02/`, and
+`output/neon_Htou_jacobian_audit_03/`. Calibration recordings/independent metric
+reference remain unavailable. Single-map continuity, holdout validation and
+metric conversion are still required before connecting this route to Boxer.
+
+Validation: `.venv/bin/python -m pytest -q tests` completed with **558 passed,
+12 skipped** (55.45s). Native CTest completed **2/2 passed** with the runtime's
+absolute `prefix/lib` on `LD_LIBRARY_PATH`. A 20-frame diagnostic smoke run with
+both snapshot flags omitted completed with **zero visual/IMU snapshots**.
+Generated datasets, feature/model weights and diagnostic outputs are not committed.
