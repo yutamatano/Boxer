@@ -13,6 +13,9 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#ifdef NEON_DIAGNOSTICS
+#include "diagnostics.h"
+#endif
 
 namespace fs = std::filesystem;
 struct Frame { long id; double time; std::string image; };
@@ -83,6 +86,15 @@ int main(int argc, char** argv) {
         if (!states) throw std::runtime_error("Cannot open states.csv");
         states << "frame_id,slam_time_s,state,mapped_features,imu_initialized,map_id,track_ms\n" << std::setprecision(17);
         cv::setNumThreads(2);
+#ifdef NEON_DIAGNOSTICS
+        std::vector<double> diagnosticTimes;
+        std::vector<long> diagnosticIds;
+        for(const auto& frame:frames) { diagnosticTimes.push_back(frame.time); diagnosticIds.push_back(frame.id); }
+        neon_diag::Open(output.string(),diagnosticTimes,diagnosticIds);
+        std::ofstream timing(output / "timing.csv");
+        timing << "source_frame_id,input_interval_ms,schedule_lag_ms,track_ms\n" << std::setprecision(17);
+        auto previousInput=std::chrono::steady_clock::time_point{};
+#endif
         ORB_SLAM3::System slam(vocabulary.string(), (prepared / "camera.yaml").string(),
                                ORB_SLAM3::System::IMU_MONOCULAR, false);
         size_t next=static_cast<size_t>(std::lower_bound(imu.begin(),imu.end(),frames.front().time,
@@ -104,6 +116,12 @@ int main(int argc, char** argv) {
             }
             if (samples.empty()) throw std::runtime_error("Missing IMU interval");
             const auto begin=std::chrono::steady_clock::now();
+#ifdef NEON_DIAGNOSTICS
+            neon_diag::Input(frame.time);
+            const double interval=i ? std::chrono::duration<double,std::milli>(begin-previousInput).count() : 0.;
+            const double lag=std::chrono::duration<double,std::milli>(begin-start).count()-(frame.time-frames.front().time)*pace*1000.;
+            previousInput=begin;
+#endif
             slam.TrackMonocular(image,frame.time,samples,frame.image);
             const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
             const int state=slam.GetTrackingState();
@@ -112,6 +130,11 @@ int main(int argc, char** argv) {
             for (auto* point : slam.GetTrackedMapPoints()) if (point && !point->isBad()) ++features;
             states << frame.id << ',' << frame.time << ',' << state << ',' << features << ',' << map.second << ',' << map.first << ',' << ms << '\n';
             states.flush();
+#ifdef NEON_DIAGNOSTICS
+            neon_diag::EndFrame(frame.time,state,slam.GetTrackedKeyPointsUn().size());
+            timing << frame.id << ',' << interval << ',' << lag << ',' << ms << '\n';
+            timing.flush();
+#endif
             metricOK += state==2 && map.second;
             if (i%100==0 || i+1==frames.size())
                 std::cout << "Standalone frame " << i+1 << '/' << frames.size() << " state=" << state << " metric=" << map.second << std::endl;
@@ -120,6 +143,9 @@ int main(int argc, char** argv) {
         slam.Shutdown();
         const auto finalPoses=slam.SaveNeonCameraTrajectory((output / "camera_trajectory.csv").string());
         const auto points=slam.SaveNeonMapPoints((output / "map_points.csv").string());
+#ifdef NEON_DIAGNOSTICS
+        neon_diag::Close();
+#endif
         std::ofstream report(output / "run.json");
         report << "{\"processed_frames\":" << frames.size() << ",\"runtime_metric_ok_frames\":" << metricOK
                << ",\"final_metric_poses\":" << finalPoses << ",\"map_points\":" << points

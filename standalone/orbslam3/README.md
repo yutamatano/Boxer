@@ -66,6 +66,50 @@ output/orbslam3_standalone/.venv/bin/python standalone/orbslam3/run.py \
 | `--lost-keyframes` | on | onは公式既定値の喪失中KF追加を有効化。preserveは入力設定を維持、offは無効化 |
 | `--min-frames` | 2 | 保存する有効な連続区間の最小長 |
 | `--convert-only` | false | Boxer推論前の実行済み出力からNPZとpipeline.jsonだけを再生成 |
+| `--diagnostics` | false | 別ビルドで初期化分岐・地図イベント・入力タイミングを記録する。閾値は変更しない |
+
+### 初期化失敗と地図のリセットを診断する
+
+```bash
+NEON_ORPHAN_GUARD=ON NEON_DIAGNOSTICS=ON bash standalone/orbslam3/build.sh
+
+output/orbslam3_standalone/.venv/bin/python standalone/orbslam3/run.py \
+  --prepared output/neon_Htou_run_01/prepared \
+  --output output/neon_Htou_init_diagnostics \
+  --start_n 25834 --max_n 900 --pace 1 --lost-keyframes on --diagnostics
+```
+
+診断版は `build_diagnostics/` に作成し、通常版の `build/` を置き換えません。
+公式ソースも変更せず、生成したコピーへ観測処理を加えます。
+固定コミットの挿入位置が変わった場合はビルドを中止します。
+`execution.json` に実際の実行バイナリとライブラリのSHA256を保存します。
+
+- `slam/init_diagnostics.csv`：全入力画像に1行。初期化の基準画像設定、
+  基準/現在画像の特徴点不足、対応点不足、IMU単眼の時間切れ、2画像復元不成立、
+  初期BA後の検査不成立、視覚初期化成功、通常追跡を区別します。
+  特徴点・対応点は本体の値です。`reference_age_s` は現在画像との差、
+  `timeout_age_s` は公式の時間切れ判定が使う前画像との差です。
+  特徴点不足と時間切れが同時成立した場合は特徴点不足を主理由とします。
+  幾何学的失敗では選択モデルF/H、RANSAC内点、良好点、三角測量点、視差、
+  姿勢の曖昧さを保存します。未評価の値は空欄で、ゼロに置換しません。
+- `slam/map_events.jsonl`：要求の重複を抑えた`RESET_REQUEST`と、
+  地図を実際に消去した後の`RESET_APPLIED`を区別します。
+  `map_epoch`は同じ地図IDでも実際のリセットごとに増加します。
+  地図作成/切替/統合、IMU初期化・最適化・尺度推定・バイアス、慣性BA段階、
+  局所BAの開始/終了、各画像での状態と未処理KF数も記録します。
+  `source_frame_id`は対象フレーム/KFの撮影時刻から特定し、不明ならnullです。
+  非同期イベントで処理対象KFを現在画像として誤記しないよう、
+  現在投入中の画像は別の`input_source_frame_id`に保存します。
+  リセット理由の`Tracking_reset_site_*`は生成Trackingソース内の呼出し位置です。
+  BAの終了イベントは関数から戻ったことを示し、収束や位置精度の保証ではありません。
+- `slam/timing.csv`：画像投入間の実時間、記録時刻から計算した投入予定に対する遅れ、
+  追跡処理時間。`pace`を変えても画像・IMUの計測時刻は変えません。
+
+観測用ログとロックも並列処理のタイミングに影響し得ます。診断あり/なしの単発の差を
+精度改善と見なさず、比較対象の診断設定を揃えて繰り返します。
+難区間への進入試験は前区間を取得率の分母に含めず、進入直前の初期化状態・地図ID・
+epochと、難区間中のリセットを確認します。進入前に地図を失っていた場合、
+「初期化済みでも通過できない」と判定してはいけません。
 
 まず `--max_n 900 --lost-keyframes preserve` で短区間を比較し、その後に設定を一つずつ
 変更してください。別ソース・ビルド条件の比較結果を、一つの変更だけの効果とは断定できません。

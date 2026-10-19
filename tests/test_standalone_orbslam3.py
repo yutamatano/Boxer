@@ -151,6 +151,7 @@ def test_native_failure_never_becomes_a_successful_pipeline(recording, tmp_path,
     runtime = tmp_path / "runtime"
     (runtime / "build").mkdir(parents=True)
     (runtime / "build/neon_standalone").write_bytes(b"fake native executable")
+    (runtime / "build/libstandalone_orb.so").write_bytes(b"fake native library")
     (runtime / "build/CMakeCache.txt").write_text("NEON_ORPHAN_GUARD:BOOL=OFF\n")
     monkeypatch.setattr(runner, "RUNTIME", runtime)
     monkeypatch.setattr(runner.subprocess, "Popen", lambda *a, **k: type("Crash", (), {"wait": lambda self, **kw: -11})())

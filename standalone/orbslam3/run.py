@@ -215,6 +215,7 @@ def main():
     parser.add_argument("--start_n", type=int, default=0)
     parser.add_argument("--max_n", type=int)
     parser.add_argument("--pace", type=float, default=1., help="1=recorded timing; 0=fastest (may starve mapping)")
+    parser.add_argument("--diagnostics", action="store_true", help="Use the separate observation-only diagnostic build")
     parser.add_argument("--lost-keyframes", choices=("preserve", "on", "off"), default="on",
                         help="on restores upstream default; preserve keeps prepared setting for comparisons")
     parser.add_argument("--min-frames", type=int, default=2)
@@ -226,9 +227,12 @@ def main():
     if not args.convert_only:
         if args.prepared is None:
             parser.error("--prepared is required unless --convert-only")
-        binary = RUNTIME / "build/neon_standalone"
+        build_dir = RUNTIME / ("build_diagnostics" if args.diagnostics else "build")
+        binary = build_dir / "neon_standalone"
         if not binary.is_file():
             parser.error("Build first: bash standalone/orbslam3/build.sh")
+        if args.diagnostics and "NEON_DIAGNOSTICS:BOOL=ON" not in (build_dir / "CMakeCache.txt").read_text():
+            parser.error("--diagnostics requires NEON_DIAGNOSTICS=ON bash standalone/orbslam3/build.sh")
         if output.exists() and any(output.iterdir()):
             parser.error("Output must be empty; existing results are preserved")
         output.mkdir(parents=True, exist_ok=True)
@@ -238,7 +242,9 @@ def main():
                    str(output / "prepared"), str(output / "slam"), str(args.pace)]
         write_json(output / "execution.json", dict(command=command, source_prepared=str(args.prepared.resolve()),
                    upstream_revision=REVISION, lost_keyframes=args.lost_keyframes,
-                   orphan_cull_guard="NEON_ORPHAN_GUARD:BOOL=ON" in (RUNTIME / "build/CMakeCache.txt").read_text(),
+                   orphan_cull_guard="NEON_ORPHAN_GUARD:BOOL=ON" in (build_dir / "CMakeCache.txt").read_text(),
+                   diagnostics=args.diagnostics,
+                   library_sha256=hashlib.sha256((build_dir / "libstandalone_orb.so").read_bytes()).hexdigest(),
                    binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
                    camera_yaml_sha256=hashlib.sha256((output / "prepared/camera.yaml").read_bytes()).hexdigest()))
         print("Running:", shlex.join(command), flush=True)

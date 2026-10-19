@@ -28,11 +28,20 @@ if ! "$runtime/.venv/bin/python" -c 'import numpy' 2>/dev/null; then
     uv --no-config --cache-dir "$runtime/uv-cache" pip install \
         --python "$runtime/.venv/bin/python" "${NEON_NUMPY_WHEEL:-numpy==2.5.2}"
 fi
-cmake -S "$task_root/standalone/orbslam3" -B "$runtime/build" \
+task_diagnostics="${NEON_DIAGNOSTICS:-OFF}"
+case "${task_diagnostics^^}" in
+    ON|TRUE|YES|Y|1) task_diagnostics=ON ;;
+    OFF|FALSE|NO|N|0) task_diagnostics=OFF ;;
+    *) echo "NEON_DIAGNOSTICS must be ON or OFF" >&2; exit 2 ;;
+esac
+task_build="$runtime/build"
+if [[ "$task_diagnostics" == ON ]]; then task_build="$runtime/build_diagnostics"; fi
+cmake -S "$task_root/standalone/orbslam3" -B "$task_build" \
     -DORB_SLAM3_ROOT="$runtime/source" -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER=/usr/bin/g++ '-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG -march=native' \
     -DNEON_ORPHAN_GUARD="${NEON_ORPHAN_GUARD:-OFF}" \
+    -DNEON_DIAGNOSTICS="$task_diagnostics" \
     -DCMAKE_PREFIX_PATH="$runtime/prefix" -DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF
-cmake --build "$runtime/build" --parallel "${NEON_BUILD_JOBS:-2}"
+cmake --build "$task_build" --parallel "${NEON_BUILD_JOBS:-2}"
 echo "Python: $runtime/.venv/bin/python"
-echo "Runner: $runtime/build/neon_standalone"
+echo "Runner: $task_build/neon_standalone"
