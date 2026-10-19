@@ -12,6 +12,7 @@ namespace neon_diag {
 namespace {
 std::mutex mutex;
 std::ofstream init, events;
+std::string directory;
 std::map<double,long> sources;
 std::map<long,unsigned long> epochs;
 unsigned long sequence=0, reset_count=0, request_count=0, pending_request=0;
@@ -59,6 +60,7 @@ void event(const std::string& kind,long map,double time,const std::string& reaso
 void Open(const std::string& dir,const std::vector<double>& times,const std::vector<long>& ids) {
     std::lock_guard<std::mutex> lock(mutex);
     if(times.size()!=ids.size()) throw std::runtime_error("Diagnostic timestamp/ID mismatch");
+    directory=dir;
     sources.clear(); epochs.clear(); sequence=reset_count=request_count=pending_request=0; input_time=-1;
     started=std::chrono::steady_clock::now();
     for(size_t i=0;i<times.size();++i) sources.emplace(times[i],ids[i]);
@@ -67,6 +69,8 @@ void Open(const std::string& dir,const std::vector<double>& times,const std::vec
     init<<"source_frame_id,slam_time_s,initial_reference_frame_id,reference_age_s,timeout_age_s,reference_keypoints,current_keypoints,initialization_matches,two_view_model,geometric_inliers,good_points,triangulated_points,parallax_deg,similar_hypotheses,geometry_result,initialization_result\n"<<std::setprecision(17);
 }
 void Close() { std::lock_guard<std::mutex> lock(mutex); init.close(); events.close(); }
+std::string SnapshotDirectory() { std::lock_guard<std::mutex> lock(mutex); return directory; }
+unsigned long MapEpoch(long map) { std::lock_guard<std::mutex> lock(mutex); return epochs[map]; }
 long Source(double t) { std::lock_guard<std::mutex> lock(mutex); return source(t); }
 void Input(double t) { std::lock_guard<std::mutex> lock(mutex); input_time=t; recorded=false; }
 void EndFrame(double time,int state,int keys) {

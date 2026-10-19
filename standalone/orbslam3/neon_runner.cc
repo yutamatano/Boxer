@@ -91,6 +91,12 @@ int main(int argc, char** argv) {
         std::vector<long> diagnosticIds;
         for(const auto& frame:frames) { diagnosticTimes.push_back(frame.time); diagnosticIds.push_back(frame.id); }
         neon_diag::Open(output.string(),diagnosticTimes,diagnosticIds);
+        if(const char* capture=std::getenv("NEON_IMU_SNAPSHOTS")) {
+            if(std::string(capture)=="1") {
+                fs::copy_file(prepared/"camera.yaml",output/"snapshot_camera.yaml");
+                fs::copy_file(prepared/"manifest.json",output/"snapshot_manifest.json");
+            }
+        }
         std::ofstream timing(output / "timing.csv");
         timing << "source_frame_id,input_interval_ms,schedule_lag_ms,track_ms\n" << std::setprecision(17);
         auto previousInput=std::chrono::steady_clock::time_point{};

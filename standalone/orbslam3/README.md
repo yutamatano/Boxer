@@ -245,3 +245,161 @@ NVIDIA OpenGLによる全30枚・逆方向シークの描画を完了しまし�
 Pythonの全体検証は `PYTHON=.venv/bin/python bash scripts/ci.sh` で529件成功、12件スキップでした。
 スキップにはCIからCUDAを隠しているテストが含まれ、上記の実GPU検証は別に行っています。
 ガードの実C++回帰テストも成功しています。
+
+### Fixed-input IMU initialization audit
+
+The optional diagnostic build can copy the numerical graph inside the first
+`Optimizer::InertialOptimization` overload, after its vertices/edges have been
+assembled. This does not sort keyframes or change estimator parameters.
+
+```bash
+NEON_ORPHAN_GUARD=ON NEON_DIAGNOSTICS=ON bash standalone/orbslam3/build.sh
+output/orbslam3_standalone/.venv/bin/python standalone/orbslam3/run.py \
+  --prepared output/neon_Htou_standalone_03/prepared \
+  --output output/imu_capture_example --start_n 9988 --max_n 900 \
+  --pace 1 --diagnostics --imu-snapshots
+.venv/bin/python standalone/orbslam3/compare_imu_initialization.py \
+  output/imu_capture_example/slam/imu_snapshot_1.json \
+  --repeats 5 --output output/imu_replay_example
+```
+
+`--imu-snapshots` defaults off and requires `--diagnostics`. Capture adds I/O
+and can influence SLAM thread scheduling; it cannot guarantee a byte-identical
+SLAM run. Every capture therefore has a native solver result, and replay must
+match that result before comparisons are interpreted. Captures contain numeric
+copies, not serialized keyframe pointers. Matrices are row-major arrays of
+17-digit decimal strings; cast them to numbers when reading JSON. Pose/velocity,
+shared biases, gravity, scale, vertex/edge insertion order, fixed flags,
+preintegration covariance and Jacobians (including the edge's cached copies),
+priors and solver settings are preserved. The original prepared camera YAML and
+manifest accompany the snapshots, including noise/extrinsics/time-offset sources.
+Preintegration data are observed from the object used by the actual edge; the
+native/replay check is necessary to detect a mutation or incomplete capture.
+
+`*.after_scale.json` and `*.after_full_ba.json` record actual camera centers
+following map scale application and following full-BA map correction. Compare
+shared source frames: a scale multiplier alone is not an absolute accuracy test.
+The replay executable loads no images and creates no SLAM threads. It uses the
+same compiled g2o and IMU edge implementations as the capture. It reproduces the
+200-iteration Levenberg solver, including its conditional initial lambda; the
+upstream `bGauss` argument is unused in this overload. Fixed pose camera
+extrinsics are recorded for interpretation; only body pose is consumed by the
+IMU-only equations. Later full BA and the complete trajectory are not replayed.
+
+### Independent correspondence benchmark
+
+```bash
+.venv/bin/python standalone/orbslam3/benchmark_neon_correspondences.py \
+  --audit output/neon_Htou_branch_audit_01 \
+  --prepared output/neon_Htou_standalone_03/prepared \
+  --output output/correspondence_example
+```
+
+This reuses the exact 370 fresh-reference failed pairs and adds 100 distinct
+control references from a previously successful tracking window. For each
+reference, offsets 1/2/3/5 are separate conditions. The unchanged native ORB
+initialization matcher must reproduce all 370 logged counts exactly. Features
+are extracted with the upstream initialization budget (5 times nFeatures).
+Multiscale ORB uses the same descriptors, removes spatial duplicates while
+preferring fine scales (pairwise radius 3 times the larger octave sigma), and applies Hamming <=50, ratio <0.9, mutual matching.
+An additional `level0_orb_control` uses that same comparison matcher with only
+octave 0, so its contrast with multiscale isolates octave eligibility. Comparing
+native ORB with the multiscale method alone also changes window, assignment and
+orientation filtering; that difference cannot be attributed to octaves alone.
+KLT uses up to 2,000 goodFeaturesToTrack corners and a 1px forward/backward gate.
+
+All methods receive the same conservative 1.5px essential-matrix RANSAC test.
+Triangulation requires positive depth, >=1 degree parallax and <=3 octave-sigma
+pixel reprojection error. The summary gate also requires 100 essential inliers,
+50 triangulated points, coverage of six cells in a 6x4 image grid, and 50
+triangulated correspondences continuing into a third frame. This is an explicitly
+chosen diagnostic proxy, not the ORB-SLAM3 initialization acceptance test or
+proof of metric trajectory accuracy. Essential-only reconstruction can remain
+ambiguous in planar or rotating scenes. Three-frame continuation is a matching
+check, not three-view bundle adjustment. Counts, geometry, distribution and
+continuation are also saved separately so a failed combined gate is interpretable.
+Native OpenCV and Python OpenCV versions may differ; the native matcher remains
+unchanged and the common geometry uses one Python OpenCV version for all methods.
+These classical CV routines run on CPU; this benchmark performs no neural
+inference. Any future learned matching experiment must require CUDA explicitly.
+
+The diagnostic executable `audit_inertial_scale_jacobian` checks the upstream
+scale Jacobian against central finite differences of the actual `VertexScale`
+update. In this pinned revision, `VertexScale` updates `s` by `s*exp(delta)`,
+but the IMU edge's scale column omits the chain-rule factor `s`. The executable
+checks scales 1, 2, and 10 and reports both the upstream discrepancy and the
+error after multiplying its column by `s`.
+
+For a separately labelled **replay-only experiment**, pass
+`--correct-scale-jacobian` to `compare_imu_initialization.py` (or as the last
+argument of the native replay executable). That experiment overrides only the
+scale column in the reconstructed graph. It does not change the live SLAM
+estimator. Native objective values, repeated replay objective values and solver
+estimates are saved; lower residual does not establish metric trajectory accuracy.
+The observed after-scale/full-BA checkpoints belong to the original native run,
+not to this hypothetical replay condition.
+
+If classical matching remains insufficient, the optional learned benchmark uses
+[official SuperPoint + LightGlue](https://github.com/cvg/LightGlue), pinned to
+`eb42fee2d71449efb0aa5c10549752b5d75384d8`. Obtain that source in
+`output/neon_lightglue_runtime/source` and place Kornia dependencies under
+`output/neon_lightglue_runtime/deps`; no application environment edit is needed.
+
+```bash
+.venv/bin/python standalone/orbslam3/benchmark_neon_lightglue.py \
+  --classical output/neon_Htou_correspondence_audit_01 \
+  --prepared output/neon_Htou_standalone_03/prepared \
+  --output output/neon_Htou_lightglue_audit_01
+```
+
+CUDA is mandatory. Feature extraction and matching use Float32, with mixed
+precision, FlashAttention's internal half conversion, and TF32 disabled.
+Original 800x600 coordinates, exact pair/control identities, thresholds and
+three-frame continuity tests match the classical benchmark. Official weights
+are downloaded inside the experiment runtime, and their hashes plus the GPU,
+package versions and feature counts are recorded. Learned correspondences are
+an independent comparison; they are not passed into ORB-SLAM3's ORB descriptors.
+
+For the recorded experiment, the isolated dependencies were installed with:
+
+```bash
+git clone https://github.com/cvg/LightGlue.git output/neon_lightglue_runtime/source
+git -C output/neon_lightglue_runtime/source checkout eb42fee2d71449efb0aa5c10549752b5d75384d8
+uv --cache-dir output/neon_lightglue_runtime/uv-cache pip install \
+  --python .venv/bin/python --target output/neon_lightglue_runtime/deps \
+  --no-deps kornia==0.8.3 kornia-rs==0.2.0
+```
+
+Measured on 2026-10-19, `output/neon_Htou_optimizer_audit_02/report.txt`
+contains the full local report. Eleven sequential 900-frame captures obtained
+10 runs without a reset after the first IMU initialization and one with an early
+reset. The early-reset run later recovered (87.33% candidate coverage), so this
+classification describes its first initializer, not failure of the entire run.
+Both saved inputs reproduced their native estimates exactly in five fresh replay
+processes. Their nine shared IMU constraints were identical, but their initial
+visual poses, velocities and gravity estimates differed. Reordering the stable
+input's graph in 13 separate conditions changed estimates by at most 4.09e-14.
+The exact visual update that first created the different map geometry remains
+unidentified.
+
+The fixed hard-reference correspondence results were:
+
+| Method | +1 frame | +2 frames | +3 frames | +5 frames |
+| --- | ---: | ---: | ---: | ---: |
+| Native ORB | 0/370 | 0/370 | 0/370 | 0/370 |
+| Level-0 comparison control | 0/370 | 0/370 | 0/370 | 0/370 |
+| Multiscale ORB | 0/370 | 0/370 | 0/370 | 0/370 |
+| KLT | 13/370 | 8/370 | 5/370 | 3/370 |
+| SuperPoint + LightGlue (CUDA Float32) | 154/370 | 194/370 | 181/370 | 154/370 |
+
+Learned matching passed the common gate at at least one offset for 287/370
+references, including 133 that failed at +1 but succeeded later. These are
+independent geometry/continuation results, not SLAM trajectory coverage or
+absolute pose accuracy. Calibration recordings and learned-feature SLAM/map
+integration remain outstanding. The full recording was not rerun.
+
+The replay-only Jacobian correction reduced stable-input chi2 from 29942.19 to
+29929.40, but increased early-reset-input chi2 from 32195.44 to 32248.01.
+It is consequently retained as a separately labelled experiment; the live
+upstream estimator is unchanged. A mathematically consistent derivative alone
+has not been shown to solve the observed initialization instability.

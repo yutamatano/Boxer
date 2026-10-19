@@ -215,12 +215,15 @@ def main():
     parser.add_argument("--start_n", type=int, default=0)
     parser.add_argument("--max_n", type=int)
     parser.add_argument("--pace", type=float, default=1., help="1=recorded timing; 0=fastest (may starve mapping)")
+    parser.add_argument("--imu-snapshots", action="store_true", help="Capture replayable numeric IMU initialization graphs (requires --diagnostics)")
     parser.add_argument("--diagnostics", action="store_true", help="Use the separate observation-only diagnostic build")
     parser.add_argument("--lost-keyframes", choices=("preserve", "on", "off"), default="on",
                         help="on restores upstream default; preserve keeps prepared setting for comparisons")
     parser.add_argument("--min-frames", type=int, default=2)
     parser.add_argument("--convert-only", action="store_true", help="Re-export a completed standalone run before Boxer inference")
     args = parser.parse_args()
+    if args.imu_snapshots and not args.diagnostics:
+        parser.error("--imu-snapshots requires --diagnostics")
     if args.start_n < 0 or (args.max_n is not None and args.max_n < 2) or args.min_frames < 2 or not math.isfinite(args.pace) or args.pace < 0:
         parser.error("Invalid frame selection, min-frames, or pace")
     output = args.output.resolve()
@@ -243,12 +246,13 @@ def main():
         write_json(output / "execution.json", dict(command=command, source_prepared=str(args.prepared.resolve()),
                    upstream_revision=REVISION, lost_keyframes=args.lost_keyframes,
                    orphan_cull_guard="NEON_ORPHAN_GUARD:BOOL=ON" in (build_dir / "CMakeCache.txt").read_text(),
-                   diagnostics=args.diagnostics,
+                   diagnostics=args.diagnostics, imu_snapshots=args.imu_snapshots,
                    library_sha256=hashlib.sha256((build_dir / "libstandalone_orb.so").read_bytes()).hexdigest(),
                    binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
                    camera_yaml_sha256=hashlib.sha256((output / "prepared/camera.yaml").read_bytes()).hexdigest()))
         print("Running:", shlex.join(command), flush=True)
         env = os.environ.copy()
+        env["NEON_IMU_SNAPSHOTS"] = "1" if args.imu_snapshots else "0"
         env["LD_LIBRARY_PATH"] = str(RUNTIME / "prefix/lib") + os.pathsep + env.get("LD_LIBRARY_PATH", "")
         with (output / "slam.log").open("w") as log:
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env, cwd=output)

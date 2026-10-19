@@ -90,6 +90,18 @@ def instrument(name, text):
         b=text.index('void TwoViewReconstruction::Normalize(',a)
         part=text[a:b].replace('return true;', 'neon_diag::TwoView().reason="SUCCESS"; return true;')
         text=text[:a]+part+text[b:]
+    elif name == 'Optimizer':
+        text = '#include "imu_snapshot.h"\n' + text
+        begin=text.index('void Optimizer::InertialOptimization(Map *pMap, Eigen::Matrix3d &Rwg, double &scale, Eigen::Vector3d &bg,')
+        end=text.index('void Optimizer::InertialOptimization(',begin+10)
+        part=text[begin:end]
+        part=replace(part,'int its = 200;', 'neon_diag::ImuSnapshot diagnosticSnapshot;\n    int its = 200;')
+        import re
+        part=re.sub(r'optimizer.addVertex\((\w+)\);',r'optimizer.addVertex(\1); diagnosticSnapshot.Vertex(\1);',part)
+        part=re.sub(r'optimizer.addEdge\((\w+)\);',r'optimizer.addEdge(\1); diagnosticSnapshot.Edge(\1);',part)
+        part=replace(part,'optimizer.setVerbose(false);', 'diagnosticSnapshot.Capture(vpKFs,pMap->GetId(),maxKFid,its,priorG,priorA,bMono,bFixedVel,bGauss);\n    optimizer.setVerbose(false);')
+        part=replace(part,'optimizer.optimize(its);','optimizer.optimize(its);\n    diagnosticSnapshot.Result(optimizer);')
+        text=text[:begin]+part+text[end:]
     elif name == 'System':
         text=replace(text,'''void System::ResetActiveMap()
 {
@@ -103,6 +115,11 @@ def instrument(name, text):
         text=replace(text,'mspMaps.insert(mpCurrentMap);', 'mspMaps.insert(mpCurrentMap);\n    neon_diag::Event("MAP_CREATED",mpCurrentMap->GetId());')
         text=replace(text,'mpCurrentMap = pMap;', 'mpCurrentMap = pMap;\n    neon_diag::Event("MAP_CHANGED",pMap->GetId());')
     elif name == 'LocalMapping':
+        text = '#include "imu_snapshot.h"\n' + text
+        text=replace(text,'mpAtlas->GetCurrentMap()->ApplyScaledRotation(Twg, mScale, true);',
+            'mpAtlas->GetCurrentMap()->ApplyScaledRotation(Twg, mScale, true);\n            neon_diag::MapCheckpoint(mpAtlas->GetCurrentMap(),"after_scale");')
+        text=replace(text,'Verbose::PrintMess("Map updated!", Verbose::VERBOSITY_NORMAL);',
+            'neon_diag::MapCheckpoint(mpAtlas->GetCurrentMap(),"after_full_ba");\n    Verbose::PrintMess("Map updated!", Verbose::VERBOSITY_NORMAL);')
         for method in ['LocalInertialBA','LocalBundleAdjustment']:
             lines=text.splitlines()
             hits=[i for i,line in enumerate(lines) if f'Optimizer::{method}(mpCurrentKeyFrame,' in line]
@@ -145,11 +162,14 @@ def main():
     p.add_argument('--mapping-source',type=Path,required=True)
     args=p.parse_args()
     args.output.mkdir(exist_ok=True)
-    for name in ['Tracking','TwoViewReconstruction','System','Atlas','LocalMapping','LoopClosing']:
+    for name in ['Tracking','TwoViewReconstruction','System','Atlas','LocalMapping','LoopClosing','Optimizer']:
         path=args.source/'src'/f'{name}.cc'
         if name=='LocalMapping':
             path=args.mapping_source
-        (args.output/f'{name}_diagnostics.cc').write_text(instrument(name,path.read_text()))
+        generated=instrument(name,path.read_text())
+        target=args.output/f'{name}_diagnostics.cc'
+        if not target.exists() or target.read_text()!=generated:
+            target.write_text(generated)
 
 
 if __name__=='__main__':
