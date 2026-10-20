@@ -733,3 +733,97 @@ The later driver smoke test is excluded from the fixed 20+20 comparison: both
 conditions completed but retained zero metric-flagged candidates, including A.
 This also limits the repeatability claim to the formal measured batch; the
 native system is not proven stable across separate launches or timing conditions.
+
+
+### Fixed-input ORB versus learned-COLMAP comparison
+
+The revised comparison removes RIM as a prerequisite. Run the existing good
+9988..10887 and hard 25834..26733 development windows, each exactly 900 images:
+
+```bash
+.venv/bin/python -m standalone.orbslam3.pose_comparison \
+  --prepared output/neon_Htou_standalone_03/prepared \
+  --output output/pose_comparison_new --repeats 5
+```
+
+The output must be new. Each window gets newly computed CUDA Float32
+SuperPoint/LightGlue features, offsets 1/2/3/5 and a verified database. Five
+independent empty-map reconstructions reuse this frozen cache through separate
+DB copies. This measures reconstruction variability conditional on identical
+features/matches; it is not five cold end-to-end neural runs. Cache preparation,
+DB copying, reconstruction/export and paced ORB times are saved separately.
+Previous image/IMU preprocessing is reused and its original wall time is unknown.
+No rejected boundary connections or saved maps initialize these trials.
+
+O uses the regular guarded native build, pace=1, lost-KF insertion on, no
+diagnostic snapshots, no descriptor tie policy and no scale-Jacobian correction.
+Classical ORB and Ceres retain their CPU implementation; neural inference never
+falls back to CPU. The run manifest freezes binary, library and calibration
+hashes. Each attempted run and its return code is retained, including failures
+and successfully completed runs with zero saved poses.
+
+`common_poses.csv` preserves one frame/model/run row, original integer epoch
+nanoseconds and camera-to-world poses. Availability includes singletons and final
+arbitrary-scale ORB poses; it does not inherit Boxer's two-consecutive-frame or
+runtime-IMU-initialization filters. Runtime OK counts and IMU metric candidates
+are reported separately. Final ORB map IDs identify surviving map history;
+earlier reset epochs are not combined from runtime states. COLMAP model overlap
+counts once in total coverage. Continuity is measured within each world, never
+by joining independently registered models. Duration is last minus first original
+timestamp (one singleton therefore has duration zero).
+
+These are output and continuity measurements. Pose quality remains unevaluated
+without independent reference observations; finite values and unit quaternions
+are format checks. RIM scan feasibility is a separate stage and missing access
+is not zero output. Physical accuracy and the holdout/full-recording stages
+remain outside this development-only comparison.
+
+
+Measured 2026-10-20 result (five completed trials per row, median [min,max]):
+
+| Window / method | Unique saved poses | Largest final world | Longest continuous span | Final worlds |
+| --- | --- | --- | --- | --- |
+| good / O | 828 [0,828] (92.0%) | 828 [0,828] | 828 frames / 82.723s [0,82.723] | 1 [0,1] |
+| good / SuperPoint+LightGlue+COLMAP | 900 [900,900] (100%) | 694 [694,694] (77.11%) | 694 frames / 69.319s | 2 [2,2] |
+| hard / O | 0 [0,0] | 0 [0,0] | 0 frames / 0s | 0 [0,0] |
+| hard / SuperPoint+LightGlue+COLMAP | 882 [881,886] (98.0%) | 204 [204,265] (22.67%) | 204 frames / 20.306s [20.306,26.407] | 12 [11,13] |
+
+All 20 processes completed without crashing. Six ORB trials completed with zero
+saved poses (one good, all five hard). Each hard ORB trial had 897/900 frames in
+NOT_INITIALIZED, two OK and one RECENTLY_LOST; its initial 70-point map lost
+local tracking before IMU initialization and was reset. This is a cold-start
+900-frame result, not the same as extracting these frames after processing the
+entire recording. Good O trial 2 had 100 runtime metric-OK frames but no retained
+final poses after repeated resets. Other good O trials retained 828 poses.
+
+COLMAP's good-window output/continuity counts agreed across all five trials,
+but this does not establish identical geometry or physical accuracy. Numerical
+CHOLMOD warnings occurred during optimization and remain in the logs. The hard
+window retained 11..13 independent models; high total output did not yield a
+single connected world. No connection, scale fitting or interpolation was added.
+
+Median per-trial wall times were O good/hard 94.39/94.03s (including pace=1),
+and C0 good/hard 711.74/244.99s. One-time fresh GPU feature/match/DB preparation
+cost 53.83/119.66/18.14s for good and 55.05/136.80/28.31s for hard. Previously
+prepared images/IMU were cached, so these are not full cold preprocessing times.
+RIM is excluded: sampled existing short recordings do not establish coverage
+of the evaluated corridor/stair scene. Reusing a short segment of the long Q
+recording remains unverified, not proven impossible; no Cloud pose output is
+available. Independent-reference accuracy remains unmeasured.
+
+Local evidence: `output/neon_pose_comparison_02/report.txt`, `trials.csv`,
+`comparison.png` / `comparison.svg`, and `final_validation.json`. All 1,800 source
+images and frozen binaries/settings were verified unchanged. Reloading all 12,469
+common pose rows preserved exact original integer timestamps and reproduced the
+metrics, with independent union/max-world counts. The original historical DB
+hash was preserved. Repository tests: **566 passed, 12 skipped**; the added
+adapter tests are included in the five focused comparison tests, all passed.
+
+
+The historical hard-window cache was also compared read-only: all 900 feature
+arrays, all 3,589 raw match arrays, every geometric-verification column and every
+logical DB table agreed with the new cache. The mapper options text also agreed.
+The historical 883/266/11 result and the new ranges therefore illustrate
+reconstruction-stage variation on identical stored inputs/settings, not a new
+feature or pair policy. The exact parallel/numerical mechanism remains unisolated.
+See `historical_input_comparison.json` for the complete equality audit.
