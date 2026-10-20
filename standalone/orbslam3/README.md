@@ -578,3 +578,158 @@ Validation: `.venv/bin/python -m pytest -q tests` completed with **558 passed,
 absolute `prefix/lib` on `LD_LIBRARY_PATH`. A 20-frame diagnostic smoke run with
 both snapshot flags omitted completed with **zero visual/IMU snapshots**.
 Generated datasets, feature/model weights and diagnostic outputs are not committed.
+
+### Connecting existing maps and bounded boundary matching
+
+`neon_map_connect.py` audits every pair of existing reconstructions using source
+image IDs and feature-observation identities. It records common image spans,
+camera-centre singular values, rotation spread, common 3D points, a training
+Sim(3), held-out point residuals and camera pose consistency. The initial gates
+require at least three shared images and 30 point correspondences, >=80% training
+consensus within 1% of target point RMS radius, held-out 95th-percentile residual
+<=2% of that radius, and camera rotation 95th percentile <=2 degrees. Rejected
+pairs remain in the report. A common image alone is not sufficient to establish
+scale, and geometric rank alone does not prove good conditioning.
+
+```bash
+.venv/bin/python -m standalone.orbslam3.neon_map_connect \
+  --baseline output/neon_Htou_learned_sfm_01/mapping_auto_900 \
+  --output output/neon_Htou_map_connect_01
+.venv/bin/python -m standalone.orbslam3.neon_sfm_continue \
+  --baseline output/neon_Htou_learned_sfm_01 \
+  --output output/neon_Htou_boundary_sfm_01 --stage prepare
+.venv/bin/python standalone/orbslam3/neon_sfm.py \
+  --prepared output/neon_Htou_standalone_03/prepared \
+  --output output/neon_Htou_boundary_sfm_01 --stage match --resume
+.venv/bin/python standalone/orbslam3/neon_sfm.py \
+  --prepared output/neon_Htou_standalone_03/prepared \
+  --output output/neon_Htou_boundary_sfm_01 --stage database --resume
+.venv/bin/python -m standalone.orbslam3.neon_sfm_continue \
+  --baseline output/neon_Htou_learned_sfm_01 \
+  --output output/neon_Htou_boundary_continuation_01 --stage continue \
+  --database output/neon_Htou_boundary_sfm_01/database.db \
+  --images output/neon_Htou_boundary_sfm_01/images
+```
+
+New experiments reuse the original Float32 feature files without extraction.
+`pair_manifest.json` is the single input to both matching and DB import; its
+SHA-256 is stored in completion markers. Changed manifests invalidate completed
+DBs. A seed DB containing pairs outside the manifest is rejected. Image IDs and
+original keypoint indices are preserved by copying the old DB into a new output.
+Only missing pairs are matched on CUDA. Every pair missing its two-view
+geometry undergoes verification, including interrupted imports whose raw matches
+already exist. `pair_import_audit.json` lists raw/geometric counts for
+every requested pair. Reconstructions use their own additional working DB copy:
+COLMAP may update SQLite bookkeeping even when consuming an existing DB.
+
+The bounded initial proposal straddles 26169→26176 and 26441→26447, with intervals
+6/7/8/10 and up to ten surrounding frames on each side (18 new pairs). A subsequent
+explicit 3×3 grid at 26410/26420/26430 versus 26450/26460/26470 is recorded as a
+separate development experiment after the first grid found no geometric support
+at the second boundary. Every continued run starts from the saved 266-image map,
+refines both existing structure and new points with fixed intrinsics, exports
+`metric=False`, and separates retained, removed and added observations. Keep a
+no-extra-pairs continuation control to distinguish new matching from restarting
+optimization. Counts and average residuals alone do not qualify a connection.
+
+### Descriptor tie A/B experiment
+
+The diagnostic build now generates an optional copy of `MapPoint.cc`; the pinned
+upstream source remains untouched. `--descriptor-ties native` is the default.
+`--descriptor-ties source` changes **only tied minimum medians** to use source
+frame ID, camera stream index, and feature index. A standalone process contains
+one recording, so recording identity is constant in this ordering. It does not
+use keyframe creation IDs or pointer values as tie-break keys. The normal/depth
+summation implementation, descriptor distance/median definition, feature budgets,
+matching thresholds, IMU settings and BA settings remain unchanged.
+
+Stable keys are resolved on demand without an auxiliary candidate allocation;
+A retains the upstream candidate allocation and selection. The earlier preflight
+that allocated a candidate-key vector even in A was excluded because it changed
+the heap layout central to this investigation; attempted runs are preserved in
+`output/neon_Htou_descriptor_ab_01/EXCLUDED.json`.
+
+```bash
+NEON_DIAGNOSTICS=ON NEON_ORPHAN_GUARD=ON bash standalone/orbslam3/build.sh
+output/orbslam3_standalone/.venv/bin/python standalone/orbslam3/run.py \
+  --prepared output/neon_Htou_standalone_03/prepared \
+  --output output/tie_example --start_n 9988 --max_n 65 --pace 1 \
+  --diagnostics --descriptor-ties source --light-maps
+.venv/bin/python -m standalone.orbslam3.descriptor_ab_report \
+  output/neon_Htou_descriptor_ab_02
+```
+
+`--light-maps` saves compact point/descriptor/observation and camera-centre CSV
+summaries at selected pre-IMU milestones. Heavy visual/IMU snapshots stay off.
+The formal protocol fixes 20 runs per condition, alternates A/B, and uses the same
+binary, orphan guard, lost-KF setting and minimal logging. Observation can still
+influence asynchronous timing, so conclusions apply to this measured protocol.
+Count resets **before** initial IMU initialization as well as afterwards. A late
+initializer has less than twenty frames of follow-up in a 65-frame recording;
+report this censoring rather than treating it as evidence of no early failure.
+The optional policy is not promoted based solely on reproducibility; tracking
+continuity and geometry must also remain useful. The scale-Jacobian experiment
+remains independent and unchanged.
+
+
+Run the complete, predeclared comparison in a **new** output directory:
+
+```bash
+.venv/bin/python -m standalone.orbslam3.descriptor_ab_experiment \
+  --prepared output/neon_Htou_standalone_03/prepared \
+  --output output/ties_new_comparison --trials 20
+.venv/bin/python -m standalone.orbslam3.descriptor_ab_report \
+  output/ties_new_comparison
+```
+
+### Measured outcome: connection and tie policy not accepted
+
+For this 900-frame development interval, only three of 55 map pairs shared
+registered images. None passed the common-observation consistency gates; COLMAP's
+reprojection-based alignment also rejected all three. The largest 266-image map
+had no shared registered images with the other maps. Existing overlap alone
+therefore cannot extend it.
+
+Boundary matching reused GPU Float32 SuperPoint features and added 18 pairs,
+then a separate nine-pair grid. Continuing the largest map produced candidates
+with 289 and 290 registered images, respectively. The latter increased the
+collection's unique registration count from 883 to 886, but the longest continuous
+interval stayed at 266. **These are rejected candidates, not usable improvements.**
+Withholding the entire 26169→26176 match edge gave cross-projection median/p95
+errors of 14.24/22.43 pixels; 42 of 58 directional tests lacked a supporting 3D
+point, and none of the three pairs triangulated on both sides shared a landmark.
+Keeping only calibrated new pair geometries did not extend the original 266.
+The native structure-less registration fallback occurred in expanded candidates;
+registration counts do not establish successful existing-point PnP or accuracy.
+No merge was forced and no interpolation was counted as registration.
+
+In the formal 20+20 alternating descriptor comparison, A (native) reset in 0/20
+runs and retained a median of 27 metric-flagged candidate frames out of 65.
+B (stable tied-minimum selection) reset in 20/20 and retained a median of three.
+All B runs first initialized at source 10049, leaving fewer than 20 follow-up
+frames; they cannot be counted as successful early survival. Within-condition
+lightweight descriptor/fusion summaries were already repeatable in A, so this
+protocol did not demonstrate a reproducibility benefit. **Keep native as default;
+do not expand B to 900 frames.** Metric flags do not establish physical accuracy.
+
+The original 883-image, 11-map result and exact original DB SHA-256 remain
+preserved. A continuation control changed only SQLite bookkeeping in the original
+DB before working-copy isolation was added; table contents were verified identical
+and the exact original binary hash was restored. Subsequent runs use independent
+DB copies and check source hashes. The active result remains 883 unique frames,
+maximum single map 266, eleven independent coordinate systems, `metric=False`.
+No full-recording or second hard-interval expansion was attempted after the
+connection quality gate failed.
+
+Detailed development evidence is in
+`output/neon_Htou_map_connect_01/report.txt` and
+`output/neon_Htou_descriptor_ab_02/analysis.json` (local, not committed).
+Validation: **563 passed, 12 skipped** in the repository suite; native CTest
+**2/2 passed**. The committed alternating-run driver also completed an actual
+one-run-per-condition smoke comparison. Generated datasets, models and snapshots
+are excluded from Git.
+
+The later driver smoke test is excluded from the fixed 20+20 comparison: both
+conditions completed but retained zero metric-flagged candidates, including A.
+This also limits the repeatability claim to the formal measured batch; the
+native system is not proven stable across separate launches or timing conditions.

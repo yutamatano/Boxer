@@ -1,4 +1,4 @@
-"""Generate observation-only copies of the pinned upstream sources."""
+"""Generate diagnostic copies with explicitly opt-in comparison policies."""
 import argparse
 from pathlib import Path
 
@@ -198,6 +198,27 @@ def instrument(name, text):
     neon_diag::Event("SCALE_REFINEMENT_ESTIMATE",mpCurrentKeyFrame->GetMap()->GetId(),mpCurrentKeyFrame->mTimeStamp,"",1,2,mScale);''')
         for stage in [1,2]:
             text=replace(text,f'cout << "end VIBA {stage}" << endl;', f'neon_diag::Event("INERTIAL_BA_STAGE_{stage}_FINISHED",mpCurrentKeyFrame->GetMap()->GetId(),mpCurrentKeyFrame->mTimeStamp);\n                                cout << "end VIBA {stage}" << endl;')
+    elif name == 'MapPoint':
+        text='#include <tuple>\n#include <cstdlib>\n'+text
+        start=text.index('void MapPoint::ComputeDistinctiveDescriptors()');end=text.index('\ncv::Mat MapPoint::GetDescriptor()',start)
+        part=text[start:end]
+        part=replace(part,'vector<cv::Mat> vDescriptors;','vector<cv::Mat> vDescriptors;\n    const char* mode=std::getenv("NEON_DESCRIPTOR_TIES");\n    const bool stable=mode && std::string(mode)=="source";')
+        for side,index in [(0,'leftIndex'),(1,'rightIndex')]:
+            old=f'vDescriptors.push_back(pKF->mDescriptors.row({index}));'
+            # Preserve the upstream candidate container and its allocation in A/B.
+            assert old in part
+        part=replace(part,'int BestMedian = INT_MAX;',"""auto stableKey = [&observations](size_t index) {
+        for(const auto& item:observations) {
+            auto k=item.first;if(k->isBad())continue;
+            int left=std::get<0>(item.second),right=std::get<1>(item.second);
+            if(left>=0){if(index==0)return std::make_tuple(neon_diag::Source(k->mTimeStamp),0,left);--index;}
+            if(right>=0){if(index==0)return std::make_tuple(neon_diag::Source(k->mTimeStamp),1,right);--index;}
+        }
+        throw std::runtime_error("Descriptor candidate origin not found");
+    };
+    int BestMedian = INT_MAX;""")
+        part=replace(part,'if(median<BestMedian)','if(median<BestMedian || (stable && median==BestMedian && stableKey(i)<stableKey(BestIdx)))')
+        text=text[:start]+part+text[end:]
     elif name == 'LoopClosing':
         for method in ['MergeLocal','MergeLocal2']:
             text=replace(text,f'void LoopClosing::{method}()\n{{', f'void LoopClosing::{method}()\n{{\n    neon_diag::Event("MERGE_BEGIN",mpCurrentKF->GetMap()->GetId(),mpCurrentKF->mTimeStamp,"{method}");')
@@ -217,7 +238,7 @@ def main():
     p.add_argument('--mapping-source',type=Path,required=True)
     args=p.parse_args()
     args.output.mkdir(exist_ok=True)
-    for name in ['Tracking','TwoViewReconstruction','System','Atlas','LocalMapping','LoopClosing','Optimizer']:
+    for name in ['Tracking','TwoViewReconstruction','System','Atlas','LocalMapping','LoopClosing','Optimizer','MapPoint']:
         path=args.source/'src'/f'{name}.cc'
         if name=='LocalMapping':
             path=args.mapping_source

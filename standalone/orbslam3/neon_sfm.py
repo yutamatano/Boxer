@@ -90,9 +90,17 @@ def extract(out,frames,prepared):
     write_json(out/'features_done.json',dict(frames=len(frames),device='cuda',dtype='float32',gpu=torch.cuda.get_device_name(0),source_revision=LIGHTGLUE_REVISION))
 
 
+def image_pairs(out,frames):
+    ids={int(r['frame_id']) for r in frames};path=out/'pair_manifest.json'
+    if not path.exists():write_json(path,dict(schema=1,pairs=[[a,a+d] for a in sorted(ids) for d in (1,2,3,5) if a+d in ids]))
+    pairs=[tuple(p) for p in json.loads(path.read_text())['pairs']]
+    if len(set(pairs))!=len(pairs) or any(len(p)!=2 or p[0]>=p[1] or not set(p)<=ids for p in pairs):raise ValueError('Invalid pair manifest')
+    return pairs,hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def match(out,frames):
     torch,_,matcher=gpu_models();(out/'matches').mkdir(exist_ok=True)
-    ids={int(r['frame_id']) for r in frames};pairs=[(a,a+d) for a in sorted(ids) for d in (1,2,3,5) if a+d in ids]
+    pairs,pair_sha=image_pairs(out,frames)
     @lru_cache(maxsize=16)
     def feature(i):return {k:torch.from_numpy(v)[None].cuda() for k,v in load_feature(out,i).items()}
     with torch.inference_mode():
@@ -102,14 +110,19 @@ def match(out,frames):
             result=matcher({'image0':feature(a),'image1':feature(b)})
             np.savez_compressed(path,matches=result['matches'][0].cpu().numpy().astype(np.uint32),scores=result['scores'][0].cpu().numpy().astype(np.float32))
             if n%50==0 or n==len(pairs):print(f'[matching] {n}/{len(pairs)} ({100*n/len(pairs):.1f}%)',flush=True)
-    write_json(out/'matches_done.json',dict(pairs=len(pairs),offsets=[1,2,3,5],device='cuda',dtype='float32'))
+    write_json(out/'matches_done.json',dict(pairs=len(pairs),pair_manifest_sha256=pair_sha,device='cuda',dtype='float32'))
 
 
 def database(out,frames,prepared):
     import pycolmap as p
-    if (out/'database_done.json').exists():return
+    requested,pair_sha=image_pairs(out,frames)
+    if (out/'database_done.json').exists():
+        done=json.loads((out/'database_done.json').read_text())
+        if done.get('pair_manifest_sha256')!=pair_sha:raise ValueError('Database pair manifest changed; use a new output and rebuild database')
+        return
     db_path=out/'database.db'
-    if db_path.exists():raise ValueError('Incomplete database exists; preserve it and use a new output')
+    seeded=(out/'database_seed.json').exists()
+    if db_path.exists() and not seeded:raise ValueError('Incomplete database exists; preserve it and use a new output')
     image_dir=out/'images';image_dir.mkdir(exist_ok=True)
     for r in frames:
         link=image_dir/f"frame_{int(r['frame_id']):08}.png"
@@ -119,24 +132,36 @@ def database(out,frames,prepared):
     # rays stay identical to OpenCV's pixel-center-at-zero convention.
     params=[K[0,0],K[1,1],K[0,2]+.5,K[1,2]+.5]
     options=p.ImageReaderOptions(camera_model='PINHOLE',camera_params=','.join(format(x,'.17g') for x in params))
-    with p.Database.open(str(db_path)):
-        pass
-    p.import_images(str(db_path),str(image_dir),camera_mode=p.CameraMode.SINGLE,options=options)
+    if not seeded:
+        with p.Database.open(str(db_path)):pass
+        p.import_images(str(db_path),str(image_dir),camera_mode=p.CameraMode.SINGLE,options=options)
     with p.Database.open(str(db_path)) as db:
         images={int(im.name[6:-4]):im for im in db.read_all_images()}
-        for i,im in images.items():db.write_keypoints(im.image_id,load_feature(out,i)['keypoints']+.5)
-        pairs=[]
-        for a in sorted(images):
-            for delta in (1,2,3,5):
-                b=a+delta
-                if b not in images:continue
-                m=load_match(out,a,b).astype(np.uint32);db.write_matches(images[a].image_id,images[b].image_id,m)
-                pairs.append(f'{images[a].name} {images[b].name}')
+        existing_ids=db.read_all_matches()[0]
+        lookup={im.image_id:i for i,im in images.items()}
+        existing={tuple(sorted((lookup[a],lookup[b]))) for pair in existing_ids for a,b in [p.pair_id_to_image_pair(pair)]}
+        if not existing<=set(requested):raise ValueError('Seed database contains pairs outside the manifest')
+        if not seeded:
+            for i,im in images.items():db.write_keypoints(im.image_id,load_feature(out,i)['keypoints']+.5)
+        pairs=[];new_pairs=[];imported_raw=0
+        for a,b in requested:
+            name=f'{images[a].name} {images[b].name}';pairs.append(name)
+            if not db.exists_matches(images[a].image_id,images[b].image_id):
+                m=load_match(out,a,b).astype(np.uint32);db.write_matches(images[a].image_id,images[b].image_id,m);imported_raw+=1
+            if not db.exists_two_view_geometry(images[a].image_id,images[b].image_id):new_pairs.append(name)
     (out/'pairs.txt').write_text('\n'.join(pairs)+'\n')
     options=p.TwoViewGeometryOptions();options.ransac.max_error=1.5;options.ransac.random_seed=0
     print('[verification] starting common calibrated database geometry',flush=True)
-    p.verify_matches(str(db_path),str(out/'pairs.txt'),options=options)
-    write_json(out/'database_done.json',dict(images=len(images),pairs=len(pairs),camera_model='PINHOLE',camera_params=params,feature_offset=.5,principal_point_offset=.5,pycolmap=p.__version__,has_cuda=p.has_cuda,database_sha256=hashlib.sha256(db_path.read_bytes()).hexdigest()))
+    (out/'new_pairs.txt').write_text('\n'.join(new_pairs)+'\n')
+    if new_pairs:p.verify_matches(str(db_path),str(out/'new_pairs.txt'),options=options)
+    with p.Database.open(str(db_path)) as db:
+        audit=[]
+        for a,b in requested:
+            ia,ib=images[a].image_id,images[b].image_id
+            m=db.read_matches(ia,ib);g=db.read_two_view_geometry(ia,ib)
+            audit.append(dict(reference=a,target=b,raw_matches=len(m),geometric_inliers=len(g.inlier_matches),geometry_config=int(g.config)))
+    write_json(out/'pair_import_audit.json',dict(pairs=audit))
+    write_json(out/'database_done.json',dict(pair_manifest_sha256=pair_sha,imported_pairs=imported_raw,verified_pairs=len(new_pairs),images=len(images),pairs=len(pairs),camera_model='PINHOLE',camera_params=params,feature_offset=.5,principal_point_offset=.5,pycolmap=p.__version__,has_cuda=p.has_cuda,database_sha256=hashlib.sha256(db_path.read_bytes()).hexdigest()))
 
 
 def reconstruction_report(model,frames,path):

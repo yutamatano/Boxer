@@ -14,7 +14,7 @@ if [[ ! -d "$runtime/source" ]]; then
     cp -a "$task_root/output/neon_vio_deps/prefix/usr" "$runtime/prefix"
     printf '%s\n' "$revision" > "$runtime/upstream_revision.txt"
 fi
-for source_file in Tracking.cc LocalMapping.cc Optimizer.cc ORBextractor.cc ORBmatcher.cc LoopClosing.cc TwoViewReconstruction.cc KeyFrame.cc; do
+for source_file in Tracking.cc LocalMapping.cc Optimizer.cc ORBextractor.cc ORBmatcher.cc LoopClosing.cc TwoViewReconstruction.cc KeyFrame.cc MapPoint.cc; do
     git -C "$upstream" show "$revision:src/$source_file" | cmp - "$runtime/source/src/$source_file"
 done
 if [[ ! -f "$runtime/source/Vocabulary/ORBvoc.txt" ]]; then

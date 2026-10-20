@@ -215,6 +215,8 @@ def main():
     parser.add_argument("--start_n", type=int, default=0)
     parser.add_argument("--max_n", type=int)
     parser.add_argument("--pace", type=float, default=1., help="1=recorded timing; 0=fastest (may starve mapping)")
+    parser.add_argument("--descriptor-ties",choices=["native","source"],default="native")
+    parser.add_argument("--light-maps",action="store_true",help="Compact pre-IMU point/pose summaries, no heavy snapshots")
     parser.add_argument("--visual-snapshots",action="store_true",help="Capture initial visual map/BA numeric states; requires --diagnostics")
     parser.add_argument("--visual-max-source",type=int,help="Stop visual observation after this source frame")
     parser.add_argument("--imu-snapshots", action="store_true", help="Capture replayable numeric IMU initialization graphs (requires --diagnostics)")
@@ -224,6 +226,8 @@ def main():
     parser.add_argument("--min-frames", type=int, default=2)
     parser.add_argument("--convert-only", action="store_true", help="Re-export a completed standalone run before Boxer inference")
     args = parser.parse_args()
+    if (args.descriptor_ties!="native" or args.light_maps) and not args.diagnostics:
+        parser.error("Descriptor tie experiment/light maps require --diagnostics")
     if args.visual_snapshots and not args.diagnostics:
         parser.error("--visual-snapshots requires --diagnostics")
     if args.imu_snapshots and not args.diagnostics:
@@ -250,12 +254,14 @@ def main():
         write_json(output / "execution.json", dict(command=command, source_prepared=str(args.prepared.resolve()),
                    upstream_revision=REVISION, lost_keyframes=args.lost_keyframes,
                    orphan_cull_guard="NEON_ORPHAN_GUARD:BOOL=ON" in (build_dir / "CMakeCache.txt").read_text(),
-                   diagnostics=args.diagnostics, imu_snapshots=args.imu_snapshots, visual_snapshots=args.visual_snapshots, visual_max_source=args.visual_max_source,
+                   descriptor_ties=args.descriptor_ties,light_maps=args.light_maps,diagnostics=args.diagnostics, imu_snapshots=args.imu_snapshots, visual_snapshots=args.visual_snapshots, visual_max_source=args.visual_max_source,
                    library_sha256=hashlib.sha256((build_dir / "libstandalone_orb.so").read_bytes()).hexdigest(),
                    binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
                    camera_yaml_sha256=hashlib.sha256((output / "prepared/camera.yaml").read_bytes()).hexdigest()))
         print("Running:", shlex.join(command), flush=True)
         env = os.environ.copy()
+        env["NEON_DESCRIPTOR_TIES"]=args.descriptor_ties
+        env["NEON_LIGHT_MAPS"]="1" if args.light_maps else "0"
         env["NEON_VISUAL_SNAPSHOTS"]="1" if args.visual_snapshots else "0"
         if args.visual_max_source is not None:env["NEON_VISUAL_MAX_SOURCE"]=str(args.visual_max_source)
         else:env.pop("NEON_VISUAL_MAX_SOURCE",None)

@@ -12,6 +12,8 @@
 #include <cstdlib>
 #include <memory>
 #include <iomanip>
+#include <fstream>
+#include <algorithm>
 namespace neon_diag {
 using namespace ORB_SLAM3;
 using boost::property_tree::ptree;
@@ -41,7 +43,16 @@ class BaselineEdge:public g2o::BaseBinaryEdge<1,double,g2o::VertexSE3Expmap,g2o:
 };
 }
 bool VisualEnabled(Map* map,double time) {const auto enabled=std::getenv("NEON_VISUAL_SNAPSHOTS");if(!enabled || std::string(enabled)!="1" || !map || map->isImuInitialized() || MapEpoch(map->GetId())!=0)return false;const auto maximum=std::getenv("NEON_VISUAL_MAX_SOURCE");return !maximum || Source(time)<=std::stol(maximum);}
-void VisualMap(Map* map,const std::string& stage,double time) {if(!VisualEnabled(map,time))return;ptree p=metadata(map,time,stage),ks,ps;
+void LightMap(Map* map,const std::string& stage,double time) {
+ const char* mode=std::getenv("NEON_LIGHT_MAPS");if(!mode || std::string(mode)!="1" || !map || map->isImuInitialized() || MapEpoch(map->GetId())!=0 || Source(time)>10025)return;
+ if(stage!="SearchInNeighbors_after" && stage!="local_ba_map_after" && !(stage=="ProcessNewKeyFrame_after" && Source(time)==10004))return;
+ std::string prefix=SnapshotDirectory()+"/light_"+std::to_string(Source(time))+"_"+stage;
+ std::ofstream points(prefix+"_points.csv"),poses(prefix+"_poses.csv");points<<std::setprecision(17)<<"observations,x,y,z,descriptor_hash\n";poses<<std::setprecision(17)<<"source,x,y,z\n";
+ for(auto k:map->GetAllKeyFrames()){auto c=k->GetCameraCenter();poses<<Source(k->mTimeStamp)<<','<<c.x()<<','<<c.y()<<','<<c.z()<<'\n';}
+ for(auto p:map->GetAllMapPoints()){if(p->isBad())continue;std::vector<std::pair<long,int>> obs;for(auto& item:p->GetObservations())if(std::get<0>(item.second)>=0)obs.emplace_back(Source(item.first->mTimeStamp),std::get<0>(item.second));std::sort(obs.begin(),obs.end());
+  for(size_t i=0;i<obs.size();++i){if(i)points<<'|';points<<obs[i].first<<':'<<obs[i].second;}auto x=p->GetWorldPos();auto d=p->GetDescriptor();uint64_t hash=14695981039346656037ULL;for(int r=0;r<d.rows;++r)for(int c=0;c<d.cols;++c){hash^=d.at<unsigned char>(r,c);hash*=1099511628211ULL;}points<<','<<x.x()<<','<<x.y()<<','<<x.z()<<','<<hash<<'\n';}
+}
+void VisualMap(Map* map,const std::string& stage,double time) {LightMap(map,stage,time);if(!VisualEnabled(map,time))return;ptree p=metadata(map,time,stage),ks,ps;
  for(auto k:map->GetAllKeyFrames()){ptree x;x.put("kf_id",k->mnId);x.put("source_frame_id",Source(k->mTimeStamp));x.put("bad",k->isBad());x.add_child("Rcw",mat(k->GetRotation()));x.add_child("tcw",mat(k->GetTranslation()));x.add_child("center",mat(k->GetCameraCenter()));ptree neighbors,slots;for(auto neighbor:k->GetVectorCovisibleKeyFrames()){ptree n;n.put("source_frame_id",Source(neighbor->mTimeStamp));n.put("weight",k->GetWeight(neighbor));neighbors.push_back({"",n});}x.add_child("neighbors_in_order",neighbors);auto matches=k->GetMapPointMatches();for(size_t i=0;i<matches.size();++i)if(matches[i] && !matches[i]->isBad()){ptree entry;entry.put("feature",i);entry.put("point_id",matches[i]->mnId);slots.push_back({"",entry});}x.add_child("feature_point_slots",slots);ks.push_back({"",x});}
  for(auto point:map->GetAllMapPoints()){if(point->isBad())continue;ptree x;x.put("point_id",point->mnId);x.add_child("xyz",mat(point->GetWorldPos()));x.add_child("observations",observation(point));x.add_child("matching_state",point_details(point));ps.push_back({"",x});}p.add_child("keyframes",ks);p.add_child("points",ps);boost::property_tree::write_json(filename(stage),p,std::locale(),false);}
 void VisualFrame(Frame* frame,const std::string& stage) {Map* map=nullptr;for(auto point:frame->mvpMapPoints)if(point && !point->isBad()){map=point->GetMap();break;}if(!VisualEnabled(map,frame->mTimeStamp))return;ptree p=metadata(map,frame->mTimeStamp,stage),ps;p.add_child("Tcw",mat(frame->GetPose().matrix()));for(size_t i=0;i<frame->mvpMapPoints.size();++i){auto point=frame->mvpMapPoints[i];if(!point || point->isBad())continue;ptree x;x.put("feature",i);x.put("point_id",point->mnId);x.add_child("xyz",mat(point->GetWorldPos()));x.add_child("observations",observation(point));x.add_child("matching_state",point_details(point));ps.push_back({"",x});}p.add_child("associations",ps);boost::property_tree::write_json(filename(stage),p,std::locale(),false);}
