@@ -1,6 +1,161 @@
 # Neonの解析とRemote SSHでの結果確認
 
-## 実行順序
+## COLMAPを選ぶ場合
+
+従来のORB-SLAM3経路は既定のまま維持しています。
+`--pose_backend colmap`ではSuperPoint＋LightGlue＋COLMAPを使用し、ORB用バイナリや語彙ファイルを必要としません。
+現在は**非実寸プレビュー**として使用します。既存の復元結果を使う例です。
+出力先には新しいディレクトリを指定してください。
+
+```bash
+python run_neon_pipeline.py \
+  --input sample_data/neon_Htou \
+  --output output/neon_colmap_good_02 \
+  --prepared output/neon_Htou_standalone_03/prepared \
+  --start_n 9988 --max_n 900 \
+  --pose_backend colmap \
+  --colmap_source output/neon_pose_comparison_02/Q-good_C0_01/mapping_auto_900 \
+  --colmap_map_policy largest \
+  --nonmetric_preview --point_cloud off \
+  --require_gpu --skip_viz
+
+python view_tracker.py \
+  --input sample_data/neon_Htou \
+  --output_dir output/neon_colmap_good_02/viewer \
+  --require_gpu --autoplay
+```
+
+900枚すべてをGPUで物体検出・3D推論し、一つのViewerで再生します。
+左・中央は各画像の検出結果、右はCOLMAPのカメラ軌跡・カメラ枠を表示します。
+**物体の3D寸法と任意尺度のカメラ移動量を混ぜないため、右側へ物体を蓄積しません。**
+姿勢のある画像でも、物体推論は独立したカメラローカル座標で実行します。
+追跡・融合・3D視線ターゲット推定・実寸点群入力は拒否します。
+`--neon_gaze`による2D視線表示は使用できます。
+この経路では軌跡の有無によらずBoxer推論をFloat32に揃えます。
+
+新しく復元する場合は`--colmap_source`を省略します。
+`--prepared`も省略すれば画像の歪み補正・縮小から実行します。
+学習特徴の抽出・対応付けにはCUDAと保存済みのLightGlue実行環境、
+幾何検証・復元には既存のPyCOLMAP実行環境が必要です
+（`output/neon_lightglue_runtime`、`output/neon_sfm_runtime`）。
+ニューラル処理はCUDA Float32です。現在のPyCOLMAP配布物にはCUDA版Ceresがないため、
+BAは従来のSfM検証と同じCPU設定を明示的に使います。CPUへ推論を切り替えることはありません。
+専用IMUノイズ値やORB-SLAM3の初期化は不要です。
+
+| 追加オプション | 既定値 | 内容 |
+|---|---|---|
+| `--pose_backend` | `orbslam3` | `orbslam3` / `colmap` |
+| `--colmap_source` | 未指定 | 保存済み`mapping_auto_*`または数値モデルディレクトリ。省略時は新規復元 |
+| `--colmap_map_policy` | `largest` | 選択範囲で最大の一地図、または`separated`で独立地図ごとに再生 |
+| `--colmap_map_id` | 未指定 | 元モデルIDを明示選択。品質不合格は拒否 |
+| `--nonmetric_preview` | 無効 | COLMAPの未検証尺度・重力を明示的に許可。COLMAP経路では必須 |
+| `--colmap_scale_m_per_unit` | 未指定 | 位置の尺度候補。指定だけでは実寸追跡を許可しない |
+| `--colmap_align_gravity` | 無効 | ネイティブIMUから共通回転の候補を求める。整合しても未検証扱い |
+| `--poses-only` | 無効 | 軌跡生成・変換・評価まで。従来の`--vio-only`と同じ指定 |
+
+`--pose_backend`、`--colmap_source`、`--colmap_map_policy`、`--colmap_map_id`、
+`--colmap_scale_m_per_unit`、`--nonmetric_preview`には、アンダースコアを
+ハイフンに置き換えた別名もあります。
+`--boxer-only`で保存済みCOLMAP結果から推論を再開する際も、
+`--nonmetric_preview --require_gpu --point_cloud off`を付けます。
+
+複数地図の場合は`--colmap_map_policy separated`を指定します。
+重複画像は「選択範囲で登録画像数が多い地図、同数なら元モデルIDが小さい地図」へ一度だけ割り当てます。
+地図IDと画像欠損の境界で区切り、未登録画像の姿勢は補間しません。
+Viewerは地図切替時に独立座標を切り替え、地図間を線や物体追跡で接続しません。
+同一地図が再登場する場合も元の世界IDを保持します。
+
+変換器単体は次のように使用できます。
+
+```bash
+python convert_colmap_trajectory.py \
+  --prepared output/neon_colmap_good_02/prepared \
+  --source output/neon_pose_comparison_02/Q-good_C0_01/mapping_auto_900 \
+  --output output/neon_colmap_conversion_02 \
+  --map-policy largest
+```
+
+元の`camera_to_world`を再度逆変換せず、3×4形式は4×4へ補完します。
+元フレームID・int64時刻・回転・併記CSVの四元数を照合します。
+NPZの`geometry_metadata`と`pipeline.json`に尺度、重力、モデル、変換、元データのSHA-256を保存します。
+`visual_pose_frames`と`metric_pose_frames`を分け、現在の後者は0です。
+任意尺度の速度は`speed_visual_units_s`で記録し、m/sや位置精度とは扱いません。
+既存の`--prepared`も指定した`--start_n` / `--max_n`で抽出し、
+900枚を指定したのに録画全体を母数にする誤集計を防ぎます。
+失敗時はCOLMAP経路の`failure.json`に理由を記録し、作成済みの結果を保全します。
+
+実寸追跡への移行には、尺度に使っていない別の距離等による検証、重力・外部校正・同期・
+地図品質の確認が残っています。今回のCLIでは尺度候補を指定しても`metric=False`を維持します。
+この接続の動作確認を、実寸3D追跡や位置精度の改善と同一視しないでください。
+
+### 2026-10-21の実データ確認
+
+以下はいずれも`sample_data/neon_Htou`を使用した結果です。
+
+| 入力・方針 | 視覚姿勢 | 率 | 表示する独立地図 | 姿勢なし | 推論・Viewerのフレーム数 |
+|---|---:|---:|---:|---:|---:|
+| Q-good 9988〜10887 / largest | 694 | 77.11% | 1 | 206 | 900 |
+| Q-hard 25834〜26733 / largest | 204 | 22.67% | 1 | 696 | 900 |
+| 同じQ-hard / separated | 886 | 98.44% | 12 | 14 | 900 |
+
+これらの**検証済み実寸姿勢はすべて0枚**です。表は位置精度の比較ではありません。
+元のQ-hardの13モデルのうち一つは、重複フレームの割当後に残る画像が0枚となるため、
+表示する世界は12個です。地図を接続した結果ではありません。
+
+Boxerの物体推論は良好・難区間の各900枚でCUDA Float32を使用しました。
+separatedの確認には、同じ難区間のカメラローカル推論結果を再利用しました。
+視覚姿勢はニューラル推論に入れず、元画像・元時刻・校正・IMUによるローカル傾きが
+一致するためです。各地図へ物体を変換・融合した再利用ではありません。
+ViewerはNVIDIA GeForce RTX 3070 Laptop GPUで各900枚を順に描画し、
+先頭へのシーク、地図切替、追跡が更新されないこと、欠損・別地図をまたぐ軌跡線がないことを確認しました。
+保存先は次のとおりです。
+
+```text
+output/neon_colmap_good_preview_01/
+output/neon_colmap_hard_preview_01/
+output/neon_colmap_hard_separated_01/
+```
+
+すぐに複数地図版を再生するコマンドです。
+
+```bash
+python view_tracker.py \
+  --input sample_data/neon_Htou \
+  --output_dir output/neon_colmap_hard_separated_01/viewer \
+  --require_gpu --autoplay
+```
+
+既存モデルを指定しない新規経路も、9988〜10027の40枚で実行し、
+画像前処理→CUDA Float32のSuperPoint / LightGlue→DB構築→COLMAP→変換→評価が完了しました。
+最大地図に40/40枚を登録しました。BAは明示的なCeres CPUです。
+保存先は`output/neon_colmap_fresh_40_01/`です。
+この40枚の結果から、全31,405枚の連続性や取得率を推定することはできません。
+
+既定のORB経路も同じ9988〜10887の900枚で実行し、
+3セッション・2実寸区間・187枚（20.78%）を出力しました。
+区間は10162〜10244の83枚と10305〜10408の104枚です。
+従来のバイナリ、校正、喪失時の停止方針、出力形式を保持し、
+`--prepared`の選択範囲が900枚であることを確認しました。
+並列処理による試行間変動があるため、枚数の完全一致を回帰条件にはしていません。
+保存先は`output/neon_orb_colmap_regression_01/`です。
+
+重力補正候補の確認では、良好区間694枚の重力方向の広がりはp95で2.959度でした。
+候補回転は作成できましたが、外部校正・同期が独立検証されていないため、
+`gravity_aligned_unverified`を維持しています。
+画像間回転とジャイロの残差p95は良好区間2.653度、難区間最大地図4.573度です。
+これらは内部の整合性診断であり、外部基準に対する姿勢精度ではありません。
+
+回帰試験は`.venv/bin/python -m pytest -q tests`で586件成功・12件スキップでした。
+GPU推論・NVIDIA描画は上記の実データ試験で別途確認しています。
+元フレーム対応、変換、尺度・品質による拒否、直接融合の拒否、地図切替、
+途中失敗時の成果物保全を含みます。`output/`内の外部ライブラリのテストは収集対象に含めません。
+
+検証ログは`output/neon_colmap_validation/`、各Viewerの結果は
+各実験出力の`viewer_validation.json`、スクリーンショットは`viewer_frame_*.png`に保存しています。
+既存の98.11%基準DBは変更せず、SHA-256は
+`c343992f366b2b087a83bb003cc4f06065b3c93388ca6554ae895edf7ea90e1f`のままです。
+
+## 実行順序（既定のORB-SLAM3）
 
 `prepare_neon_vio.py` → `mono_inertial_neon` →
 `convert_neon_trajectory.py` → `run_boxer.py` → 動画・CSV確認です。

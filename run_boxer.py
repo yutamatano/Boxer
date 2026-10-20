@@ -113,6 +113,7 @@ def main():
     points.add_argument("--point_cloud", choices=["auto", "on", "off"], default="auto", help="point input: auto uses available points, on requires them, off uses missing-depth inputs")
     points.add_argument("--no_sdp", dest="point_cloud", action="store_const", const="off", help="alias for --point_cloud off")
     parser.add_argument("--neon_geometry", type=str, help="Neon NPZ: timestamps_ns, T_world_camera, optional points_world (see README)")
+    parser.add_argument("--nonmetric_preview", action="store_true", help="Keep unvalidated COLMAP poses for display; infer objects in independent local frames")
     parser.add_argument("--neon_imu_config", type=str, help="Prepared Neon manifest.json supplying image clock, IMU offset and camera-to-IMU calibration for local gravity")
     parser.add_argument("--neon_gaze", action="store_true", help="Export frame-sampled Neon gaze and overlay it on output images")
     parser.add_argument("--gaze_targets", action="store_true", help="Estimate gaze positions on current 3D box surfaces; enables --neon_gaze")
@@ -209,6 +210,8 @@ def main():
                 parser.error("Cached Neon fusion requires input coordinate metadata")
             with open(metadata_path) as f:
                 metadata = json.load(f)
+            from utils.neon_geometry import require_world_operations
+            require_world_operations(metadata.get("pose_geometry_metadata", {}), fuse=True)
             if "pipeline_parts" in metadata:
                 parser.error("Fuse individual pipeline segments; replay combines independent worlds")
             if metadata.get("coordinate_frame") not in (
@@ -265,8 +268,15 @@ def main():
                 geometry_path=args.neon_geometry,
                 gaze=args.neon_gaze, gaze_max_delta_ms=args.gaze_max_delta_ms,
                 imu_config_path=args.neon_imu_config,
+                nonmetric_preview=args.nonmetric_preview,
             )
         except (ValueError, ImportError, OSError) as exc:
+            parser.error(str(exc))
+        from utils.neon_geometry import require_world_operations
+        try:
+            require_world_operations(loader.pose_metadata, track=args.track, fuse=args.fuse, gaze_targets=args.gaze_targets)
+        except ValueError as exc:
+            loader.close()
             parser.error(str(exc))
     elif dataset_type == "scannet":
         loader = ScanNetLoader(

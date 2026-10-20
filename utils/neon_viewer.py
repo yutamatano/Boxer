@@ -71,6 +71,7 @@ def build_neon_context(recording, geometry, log_dir, write_name, detections,
         resize=metadata["image_size"],
         geometry_path=geometry,
         point_cloud=point_cloud,
+        nonmetric_preview=metadata.get("nonmetric_preview", False),
     )
     try:
         if not np.array_equal(loader.timestamps_ns[frame_ids], timestamps):
@@ -108,6 +109,13 @@ def build_neon_context(recording, geometry, log_dir, write_name, detections,
             "time_to_uids_slamr": {},
             "uid_to_p3": {},
         }
+        if metadata.get("nonmetric_preview"):
+            preview_valid = loader.visual_pose_valid
+            context.update(nonmetric_preview=True, pose_metadata=loader.pose_metadata,
+                preview_traj=[PoseTW.from_matrix(torch.from_numpy(loader.poses[gi])) if gi >= 0 else loader.local_camera_pose() for gi in loader.geometry_indices],
+                preview_pose_by_time=dict(zip(map(int, timestamps), map(bool, preview_valid))),
+                preview_segment_by_time={int(ts): 0 if ok else -1 for ts, ok in zip(timestamps, preview_valid)},
+                active_world_segment=0, world_contexts={0: {"uid_to_p3": {}, "time_to_uids_slaml": {}, "time_to_uids_slamr": {}}})
         # Reuse the viewer's point/observation representation. A static map has
         # no per-frame observation evidence: its observation dictionaries stay empty.
         if loader.points is not None and loader.has_world_poses:
@@ -151,7 +159,8 @@ def _build_pipeline_context(recording, root, prefix, metadata, detections, point
         rows = list(csv.DictReader(stream))
     ids = np.array([int(row["frame_id"]) for row in rows], dtype=np.int64)
     times = np.array([int(row["time_ns"]) for row in rows], dtype=np.int64)
-    frame_data, worlds = {}, {}
+    preview = bool(metadata.get("nonmetric_preview"))
+    frame_data, worlds, preview_data, world_geometry = {}, {}, {}, {}
     asset_keys = ("uid_to_p3", "time_to_uids_slaml", "time_to_uids_slamr")
     for part in metadata["pipeline_parts"]:
         directory = (root / part["results"]).resolve()
@@ -159,7 +168,7 @@ def _build_pipeline_context(recording, root, prefix, metadata, detections, point
         if "pipeline_parts" in leaf_metadata:
             raise ValueError("Nested pipeline replay is not supported")
         world_id = int(part["world_segment_id"])
-        expected = "world_z_up" if world_id >= 0 else "per_frame_assumed_upright"
+        expected = "world_z_up" if world_id >= 0 and not preview else "per_frame_assumed_upright"
         if leaf_metadata.get("coordinate_frame") != expected or any(
             leaf_metadata.get(key) != metadata.get(key) for key in (
                 "image_size", "scene_camera_matrix", "scene_distortion_coefficients"
@@ -175,12 +184,15 @@ def _build_pipeline_context(recording, root, prefix, metadata, detections, point
         )
         try:
             if world_id >= 0:
-                if world_id in worlds:
+                if world_id in worlds and (not preview or world_geometry[world_id] != str(geometry)):
                     raise ValueError("Duplicate independent world segment ID")
+                world_geometry[world_id] = str(geometry)
                 worlds[world_id] = {key: leaf[key] for key in asset_keys}
             for i, ts in enumerate(timeline):
                 if ts in frame_data:
                     raise ValueError("Pipeline replay parts overlap")
+                if preview:
+                    preview_data[ts] = leaf["preview_traj"][i] if leaf.get("preview_pose_by_time", {}).get(ts, False) else None
                 frame_data[ts] = (int(leaf["source_frame_ids"][i]), leaf["traj"][i],
                                   leaf["calibs"][i], world_id)
         finally:
@@ -191,9 +203,9 @@ def _build_pipeline_context(recording, root, prefix, metadata, detections, point
         fid, ts = int(row["frame_id"]), int(row["time_ns"])
         if (frame_data[ts][0] != fid
                 or frame_data[ts][3] != int(row["world_segment_id"])
-                or row["has_world_pose"] != ("1" if frame_data[ts][3] >= 0 else "0")):
+                or row["has_world_pose"] != ("1" if frame_data[ts][3] >= 0 and not preview else "0")):
             raise ValueError("Pipeline replay has inconsistent frame/world identity")
-    valid = np.array([frame_data[int(ts)][3] >= 0 for ts in times])
+    valid = np.array([frame_data[int(ts)][3] >= 0 and not preview for ts in times])
     expected = "world_z_up" if valid.any() else "per_frame_assumed_upright"
     if valid.any() and not valid.all():
         expected = "mixed_world_and_per_frame"
@@ -223,6 +235,13 @@ def _build_pipeline_context(recording, root, prefix, metadata, detections, point
         }
         if active_world is not None:
             context.update(worlds[active_world])
+        if preview:
+            if any((preview_data[int(ts)] is not None) != bool(int(row.get("visual_pose_available", "0"))) for ts, row in zip(times, rows)):
+                raise ValueError("Preview visual pose flags differ from exact geometry")
+            context.update(nonmetric_preview=True, pose_metadata=metadata["pose_geometry_metadata"],
+                preview_traj=[preview_data[int(ts)] if preview_data[int(ts)] is not None else poses[i] for i, ts in enumerate(times)],
+                preview_pose_by_time={int(ts): preview_data[int(ts)] is not None for ts in times},
+                preview_segment_by_time={int(ts): frame_data[int(ts)][3] for ts in times})
         from utils.gaze_viewer import load_gaze_frames
 
         context["gaze_frames"] = load_gaze_frames(

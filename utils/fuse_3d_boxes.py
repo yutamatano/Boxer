@@ -939,6 +939,15 @@ def fuse_obbs_from_csv(
     Returns:
         List of fused instances
     """
+    from pathlib import Path
+    import json
+    from utils.neon_geometry import require_world_operations
+    path = Path(input_path)
+    prefix = path.stem.split("_3dbbs")[0]
+    metadata = path.parent / f"{prefix}_input.json"
+    if metadata.exists():
+        saved = json.loads(metadata.read_text())
+        require_world_operations(saved.get("pose_geometry_metadata", {}), fuse=True)
     # Determine output path
     if output_path is None:
         base, ext = os.path.splitext(input_path)

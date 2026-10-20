@@ -1851,6 +1851,9 @@ class OBBViewer(OrbitViewer):
 
     def _run_fusion(self) -> None:
         """Run fusion on all detections and build fused geometry."""
+        if getattr(self, "_nonmetric_preview", False):
+            print("Fusion disabled for unvalidated COLMAP preview")
+            return
         # Get filtered detections (uses cache)
         filtered_obbs, filtered_indices = self._get_filtered_obbs()
 
@@ -3336,13 +3339,15 @@ class SequenceOBBViewer(OBBViewer):
 
     def _build_trajectory_geometry(self) -> None:
         """Build full trajectory segment array for trajectory tail rendering."""
-        if self.traj is None or getattr(self, "_frame_local", False):
+        preview = getattr(self, "_nonmetric_preview", False)
+        trajectory = self._preview_traj if preview else self.traj
+        if trajectory is None or (getattr(self, "_frame_local", False) and not preview):
             return
-        if hasattr(self.traj, "t"):
-            positions = self.traj.t.cpu().float()
+        if hasattr(trajectory, "t"):
+            positions = trajectory.t.cpu().float()
         else:
             positions = torch.stack(
-                [pose.t.reshape(3).cpu().float() for pose in self.traj], dim=0
+                [pose.t.reshape(3).cpu().float() for pose in trajectory], dim=0
             )
         N = len(positions)
         if N < 2:
@@ -3358,7 +3363,7 @@ class SequenceOBBViewer(OBBViewer):
         self._traj_all_segments = traj_data.numpy().astype("f4")
         if len(self.pose_ts) >= 2:
             self._traj_seg_ts = self.pose_ts[:-1]
-            world_by_time = getattr(self, "_neon_world_pose_by_time", None)
+            world_by_time = self._preview_pose_by_time if preview else getattr(self, "_neon_world_pose_by_time", None)
             if world_by_time is not None:
                 valid = np.array([
                     world_by_time.get(int(ts), False) for ts in self.pose_ts
@@ -3366,7 +3371,7 @@ class SequenceOBBViewer(OBBViewer):
                 # Never connect a real world pose to an assumed local pose or
                 # draw a line across a missing-pose interval.
                 mask = valid[:-1] & valid[1:]
-                segments = getattr(self, "_neon_world_segment_by_time", None)
+                segments = self._preview_segment_by_time if preview else getattr(self, "_neon_world_segment_by_time", None)
                 if segments is not None:
                     current = np.array([
                         segments[int(ts)] == self._active_neon_world_segment
@@ -3380,7 +3385,7 @@ class SequenceOBBViewer(OBBViewer):
 
     def _update_trajectory_tail(self, ts_ns: int) -> None:
         """Upload trajectory segments within trailing time window."""
-        world_by_time = getattr(self, "_neon_world_pose_by_time", None)
+        world_by_time = self._preview_pose_by_time if getattr(self, "_nonmetric_preview", False) else getattr(self, "_neon_world_pose_by_time", None)
         if world_by_time is not None and not world_by_time.get(int(ts_ns), False):
             self.traj_instance_count = 0
             return
@@ -3425,7 +3430,7 @@ class SequenceOBBViewer(OBBViewer):
 
     def _build_frustum_geometry(self, cam: CameraTW, T_wr: PoseTW) -> None:
         """Build frustum line geometry for current frame camera pose."""
-        if getattr(self, "_current_frame_local", False):
+        if getattr(self, "_current_frame_local", False) and not getattr(self, "_nonmetric_preview", False):
             self.frustum_instance_count = 0
             return
         if self.frustum_instance_vbo is not None:
@@ -3997,6 +4002,10 @@ class TrackerViewer(SequenceOBBViewer):
         """
         self._prebuilt_seq_ctx = seq_ctx
         global _verbose_logging
+        self._nonmetric_preview = bool((seq_ctx or {}).get("nonmetric_preview"))
+        self._preview_traj = (seq_ctx or {}).get("preview_traj")
+        self._preview_pose_by_time = (seq_ctx or {}).get("preview_pose_by_time")
+        self._preview_segment_by_time = (seq_ctx or {}).get("preview_segment_by_time")
         self._frame_local = bool(seq_ctx and seq_ctx.get("frame_local"))
         self._neon_world_pose_by_time = (seq_ctx or {}).get("world_pose_by_time")
         self._neon_world_segment_by_time = (seq_ctx or {}).get("world_segment_by_time")
@@ -4386,7 +4395,7 @@ class TrackerViewer(SequenceOBBViewer):
         if self._data_source == "neon":
             self.show_raw_set = True
         if self._frame_local:
-            self.show_trajectory = False
+            self.show_trajectory = self._nonmetric_preview
             self.show_rgb_raw = True
         self.traj_instance_vbo = None
         self.traj_instance_vao = None
@@ -4401,6 +4410,8 @@ class TrackerViewer(SequenceOBBViewer):
         self.outline_instance_count = 0
         self._build_trajectory_geometry()
         self._load_semidense_points()
+        if self._nonmetric_preview and not kwargs.get("load_view_data"):
+            self._focus_on_scene()
         if init_show_obs:
             self.show_obs_points = True
 
@@ -4458,6 +4469,21 @@ class TrackerViewer(SequenceOBBViewer):
             f"TrackerViewer init complete in {(time_module.perf_counter() - t_init0):.2f}s"
         )
 
+    def _focus_on_scene(self):
+        if not getattr(self, "_nonmetric_preview", False):
+            return super()._focus_on_scene()
+        positions = [
+            pose.t.reshape(3).cpu().float().numpy()
+            for ts, pose in zip(self.pose_ts, self._preview_traj)
+            if self._preview_pose_by_time[int(ts)]
+            and self._preview_segment_by_time[int(ts)] == self._active_neon_world_segment
+        ]
+        if positions:
+            positions = np.stack(positions)
+            low, high = positions.min(axis=0), positions.max(axis=0)
+            self.camera_target = (low + high) / 2
+            self.camera_distance = max(float(np.linalg.norm(high - low)) * 1.5, 1.)
+
     def _get_3d_viewport_size(self) -> tuple[int, int]:
         """Return (width, height) of the 3D viewport (right of controls + RGB panels)."""
         w, h = self.wnd.size
@@ -4487,7 +4513,7 @@ class TrackerViewer(SequenceOBBViewer):
             # No detections loaded: fall back to static orbit camera.
             return super().get_camera_matrices()
 
-        world_by_time = getattr(self, "_neon_world_pose_by_time", None)
+        world_by_time = self._preview_pose_by_time if getattr(self, "_nonmetric_preview", False) else getattr(self, "_neon_world_pose_by_time", None)
         ts = self.sorted_timestamps[self.current_frame_idx]
         if world_by_time is not None and not world_by_time.get(ts, False):
             ts = self._last_world_frame_ts
@@ -4521,6 +4547,8 @@ class TrackerViewer(SequenceOBBViewer):
             return projection, view, mvp
 
         cam, T_wr = self._get_cam_and_pose(ts)
+        if getattr(self, "_nonmetric_preview", False):
+            T_wr = self._preview_traj[int(np.searchsorted(self.pose_ts, ts))].float()
 
         # T_world_camera = T_world_rig @ T_rig_camera
         T_wc = T_wr @ cam.T_camera_rig.inverse()
@@ -4986,11 +5014,18 @@ class TrackerViewer(SequenceOBBViewer):
         if had_points:
             self.show_global_points = show_global
         self._build_trajectory_geometry()
+        if getattr(self, "_nonmetric_preview", False):
+            self._focus_on_scene()
         self._smooth_eye = self._smooth_target = self._smooth_up = None
 
     def _step_neon_tracker(self, target_idx: int) -> None:
         """Advance world tracking only on registered frames; RGB keeps all frames."""
         ts = self.sorted_timestamps[target_idx]
+        if getattr(self, "_nonmetric_preview", False):
+            world = self._preview_segment_by_time[ts]
+            if world >= 0 and world != self._active_neon_world_segment:
+                self._switch_neon_world(world)
+            return
         if not self.freeze_tracker and target_idx not in (
             self.current_frame_idx, self.current_frame_idx + 1
         ):
@@ -5391,6 +5426,12 @@ class TrackerViewer(SequenceOBBViewer):
             self.traj_instance_count = 0
             self.outline_instance_count = 0
             self.obs_point_count = 0
+            if self._nonmetric_preview:
+                self._update_trajectory_tail(ts)
+                if self._preview_pose_by_time.get(ts, False):
+                    pose = self._preview_traj[int(np.searchsorted(self.pose_ts, ts))].float()
+                    self._build_frustum_geometry(cam, pose)
+                    self._last_world_frame_ts = ts
             return
 
         # Update stats
@@ -6263,7 +6304,9 @@ class TrackerViewer(SequenceOBBViewer):
         )
 
         # === Playback Controls (kept identical to fusion) ===
-        if self._current_frame_local:
+        if self._nonmetric_preview:
+            imgui.text_wrapped("COLMAP preview: scale and gravity unverified. Trajectory only; per-frame objects in images. Tracking/fusion disabled.")
+        elif self._current_frame_local:
             imgui.text_wrapped(
                 "No camera pose: per-frame 3D in images only. World model held."
             )

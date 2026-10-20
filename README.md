@@ -279,6 +279,14 @@ segments that the existing `--neon_geometry` option accepts. Supply the same NPZ
 to `view_tracker.py` to replay the detections and gaze in that segment's world frame.
 
 The recommended end-to-end entry point is now `run_neon_pipeline.py`.
+The default pose backend remains `orbslam3`. Use `--pose_backend colmap`
+with `--nonmetric_preview --point_cloud off` to reuse or generate SuperPoint /
+LightGlue / COLMAP poses without requiring an ORB executable. The preview keeps
+local per-frame 3D detections separate from the arbitrary-scale visual trajectory;
+world tracking, fusion and 3D gaze targets remain disabled. `largest` and
+`separated` map policies preserve independent world identities. See
+[COLMAP commands and options](docs/neon_pipeline.md#colmapを選ぶ場合).
+
 It stops a SLAM session at the first loss/reset after metric initialization,
 exports the optimized camera poses and sparse map before they are erased,
 and restarts on the remaining source frames. Each valid interval is converted

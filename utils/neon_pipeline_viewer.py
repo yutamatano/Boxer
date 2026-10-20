@@ -31,10 +31,11 @@ def assemble_replay(summary, out):
     Geometry and original interval outputs remain the source of truth. Nothing
     estimates a transform between independent SLAM maps.
     """
+    preview = bool(summary.get("nonmetric_preview"))
     out = Path(out).resolve()
     root = out / "viewer" / Path(summary["recording"]).name
     parts, frames, by_frame = [], [], {}
-    sources = [(i, part) for i, part in enumerate(summary["segments"])]
+    sources = [(part.get("world_id", i), part) for i, part in enumerate(summary["segments"])]
     sources += [(-1, part) for part in summary["frame_only_intervals"]]
     common = None
     for world_id, part in sources:
@@ -42,7 +43,7 @@ def assemble_replay(summary, out):
         metadata = json.loads((path / "boxer_input.json").read_text())
         if metadata.get("dataset") != "neon" or "pipeline_parts" in metadata:
             raise ValueError("Replay parts must be individual Neon inference outputs")
-        expected = "world_z_up" if world_id >= 0 else "per_frame_assumed_upright"
+        expected = "world_z_up" if world_id >= 0 and not preview else "per_frame_assumed_upright"
         if metadata.get("coordinate_frame") != expected:
             raise ValueError("Pipeline part has an inconsistent coordinate frame")
         calibration = {
@@ -66,7 +67,7 @@ def assemble_replay(summary, out):
             fid, ts = int(row["frame_id"]), int(row["time_ns"])
             if fid in by_frame or ts in times:
                 raise ValueError("Pipeline replay parts overlap or repeat timestamps")
-            flag = "1" if world_id >= 0 else "0"
+            flag = "1" if world_id >= 0 and not preview else "0"
             if row.get("has_world_pose", flag) != flag:
                 raise ValueError("Pipeline part has inconsistent pose flags")
             record = dict(
@@ -76,6 +77,7 @@ def assemble_replay(summary, out):
                 has_world_pose=int(flag),
                 world_segment_id=world_id,
             )
+            if preview: record["visual_pose_available"] = int(world_id >= 0)
             by_frame[fid] = record
             frames.append(record)
             times[ts] = fid
@@ -145,7 +147,7 @@ def assemble_replay(summary, out):
         has_world_poses=bool(valid),
         geometry_path=None,
         world_pose_frames=valid,
-        independent_world_segments=len(summary["segments"]),
+        independent_world_segments=len({p["world_segment_id"] for p in parts if p["world_segment_id"] >= 0}),
         pipeline_parts=[
             {
                 "results": os.path.relpath(part["path"], root),
@@ -159,6 +161,10 @@ def assemble_replay(summary, out):
             for part in parts
         ],
     )
+    if preview:
+        metadata.update(nonmetric_preview=True, pose_backend="colmap", metric=False,
+                        pose_units=summary["pose_units"], visual_pose_frames=summary["visual_pose_frames"],
+                        pose_geometry_metadata=summary["maps"][0]["metadata"])
     metadata["point_cloud"] = "per_segment"
     metadata["local_gravity"] = {
         "method": "per-part native IMU gravity; voxel tilt only; no position estimate",

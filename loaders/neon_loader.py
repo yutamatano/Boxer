@@ -40,6 +40,7 @@ class NeonLoader(BaseLoader):
         imu_time_source="primary",
         imu_offset_ms=0.,
         imu_config_path=None,
+        nonmetric_preview=False,
     ):
         if start_n < 0 or skip_n < 1 or (max_n is not None and max_n < 1):
             raise ValueError("Require start_n >= 0, skip_n >= 1 and max_n >= 1")
@@ -148,10 +149,13 @@ class NeonLoader(BaseLoader):
                 str(Path(geometry_path).expanduser().resolve())
                 if geometry_path else None
             )
+            self.nonmetric_preview = nonmetric_preview
+            self.pose_metadata = dict(pose_backend="none", metric=False, world_inference_allowed=False)
             self.alignment_metadata = None
             if geometry_path is not None:
                 self._load_geometry(geometry_path, load_points=point_cloud != "off")
-            self.world_pose_valid = self.geometry_indices >= 0
+            self.visual_pose_valid = self.geometry_indices >= 0
+            self.world_pose_valid = self.visual_pose_valid & bool(self.pose_metadata.get("world_inference_allowed", False))
             self.has_world_poses = bool(self.world_pose_valid.any())
             self.use_points = point_cloud != "off" and self.points is not None
             if point_cloud == "on" and not self.use_points:
@@ -208,7 +212,12 @@ class NeonLoader(BaseLoader):
             f"==> World poses: {int(self.world_pose_valid.sum())}/{self.length}; "
             "remaining frames use independent camera-local 3D predictions"
         )
-        if not self.has_world_poses:
+        if self.pose_metadata.get("pose_backend") == "colmap" and not self.has_world_poses:
+            print(
+                f"==> COLMAP preview poses: {int(self.visual_pose_valid.sum())}/{self.length}; "
+                "scale/gravity unverified. Objects stay camera-local; trajectory is display-only."
+            )
+        elif not self.has_world_poses:
             print(
                 "==> No camera trajectory: predictions use independent local frames. "
                 "Native IMU tilt is used when available; metric depth/size remain unverified. "
@@ -227,6 +236,12 @@ class NeonLoader(BaseLoader):
         with np.load(Path(path).expanduser(), allow_pickle=False) as data:
             if not {"timestamps_ns", "T_world_camera"} <= set(data.files):
                 raise ValueError("Geometry requires timestamps_ns and T_world_camera")
+            from utils.neon_geometry import geometry_metadata
+            self.pose_metadata = geometry_metadata(data)
+            if self.pose_metadata.get("pose_backend") == "colmap" and not self.pose_metadata["world_inference_allowed"] and not self.nonmetric_preview:
+                raise ValueError("COLMAP arbitrary/unvalidated geometry requires --nonmetric_preview")
+            if self.pose_metadata.get("pose_backend") == "colmap" and not self.pose_metadata["world_inference_allowed"]:
+                load_points = False
             ts = data["timestamps_ns"]
             if ts.ndim != 1 or ts.dtype != np.dtype("int64") or not len(ts):
                 raise ValueError(
@@ -241,6 +256,8 @@ class NeonLoader(BaseLoader):
                 raise ValueError(
                     "Geometry timestamps must match the exact .time of source frames"
                 )
+            if "source_frame_ids" in data and (data["source_frame_ids"].dtype != np.dtype("int64") or not np.array_equal(data["source_frame_ids"], source_indices)):
+                raise ValueError("Geometry source_frame_ids do not match exact source timestamps")
             selected_ts = self.timestamps_ns[self.frame_indices]
             indices = np.searchsorted(ts, selected_ts)
             matched = ts[np.minimum(indices, len(ts) - 1)] == selected_ts
@@ -397,6 +414,10 @@ class NeonLoader(BaseLoader):
                 "has_world_pose in the frame CSV; 0 = independent local 3D"
             ),
             "alignment": self.alignment_metadata,
+            "pose_geometry_metadata": self.pose_metadata,
+            "nonmetric_preview": bool(self.nonmetric_preview and self.pose_metadata.get("pose_backend") == "colmap"),
+            "visual_geometry_path": self.geometry_path if self.pose_metadata.get("pose_backend") == "colmap" else None,
+            "visual_pose_frames": int(self.visual_pose_valid.sum()),
             "local_gravity": {
                 "method": "native IMU xyzw SLERP; voxel tilt only; no position or heading estimate",
                 "imu_frames": int(self.local_gravity_valid.sum()),

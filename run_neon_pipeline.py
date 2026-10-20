@@ -78,6 +78,9 @@ def neon_imu_options(summary):
 
 def run_boxer_segments(summary, out, args):
     recording = Path(summary["recording"])
+    preview = bool(summary.get("nonmetric_preview"))
+    if preview and (args.fuse or getattr(args, "gaze_targets", False)):
+        raise ValueError("Nonmetric COLMAP preview disables fusion and 3D gaze targets")
     completed = 0
     total = summary.get("input_frames", sum(s["max_n"] for s in summary["segments"]))
     for i, segment in enumerate(summary["segments"]):
@@ -97,12 +100,15 @@ def run_boxer_segments(summary, out, args):
             1,
             "--point_cloud",
             getattr(args, "point_cloud", "auto"),
-            "--track",
             "--output_dir",
             results,
             "--labels",
             args.labels,
         ]
+        if preview:
+            command += ["--nonmetric_preview", "--force_precision", "float32"]
+        else:
+            command += ["--track"]
         if args.force_cpu:
             command += ["--force_cpu"]
         if getattr(args, "require_gpu", False):
@@ -157,7 +163,8 @@ def run_frame_estimates(summary, out, args):
     recording = Path(summary["recording"])
     frame_ids = selected_frame_ids(summary["prepared"])
     intervals = uncovered_intervals(frame_ids, summary["segments"])
-    completed = summary["usable_frames"]
+    pose_frames = summary.get("visual_pose_frames", summary["usable_frames"])
+    completed = pose_frames
     summary["frame_only_intervals"] = []
     for i, interval in enumerate(intervals):
         results = out / f"frame_only_{i:03d}"
@@ -181,6 +188,8 @@ def run_frame_estimates(summary, out, args):
         ]
         if args.force_cpu:
             command += ["--force_cpu"]
+        if summary.get("nonmetric_preview"):
+            command += ["--force_precision", "float32"]
         if getattr(args, "require_gpu", False):
             command += ["--require_gpu"]
         if getattr(args, "skip_viz", False):
@@ -203,7 +212,7 @@ def run_frame_estimates(summary, out, args):
             s["max_n"] for s in summary["frame_only_intervals"]
         )
         summary["total_estimated_frames"] = (
-            summary["usable_frames"] + summary["frame_only_frames"]
+            pose_frames + summary["frame_only_frames"]
         )
         write_json(out / "pipeline.json", summary)
 
@@ -216,7 +225,11 @@ def evaluate_segments(summary, out, reference=None):
     with StageProgress(out, "軌跡評価", len(summary["segments"])) as progress:
         for i, segment in enumerate(summary["segments"]):
             output = out / f"geometry_evaluation_{i:03d}.json"
-            evaluate(summary["prepared"], segment["geometry"], output, reference)
+            if summary.get("pose_backend") == "colmap":
+                evaluate(summary["prepared"], segment["geometry"], output, reference,
+                         source_interval=(segment["start_n"], segment["max_n"]))
+            else:
+                evaluate(summary["prepared"], segment["geometry"], output, reference)
             segment["evaluation"] = str(output)
             progress.update(i + 1)
     write_json(out / "pipeline.json", summary)
@@ -236,8 +249,126 @@ def run_inference(summary, out, args):
     print("Viewer:", shlex.join(command), flush=True)
 
 
+def run_colmap_pipeline(args, recording, out):
+    from convert_colmap_trajectory import convert as convert_colmap
+    from utils.neon_colmap_pipeline import select_prepared, prepare_visual
+
+    if not args.nonmetric_preview:
+        raise ValueError(
+            "COLMAP currently requires --nonmetric_preview; scale alone does not validate metric tracking"
+        )
+    if args.fuse or args.gaze_targets or args.point_cloud == "on":
+        raise ValueError(
+            "Nonmetric COLMAP disables fusion, 3D gaze targets and metric point-cloud input"
+        )
+    out.mkdir(parents=True, exist_ok=True)
+    try:
+        prepared = out / "prepared"
+        with StageProgress(out, "COLMAP画像前処理", 1):
+            if args.prepared:
+                select_prepared(
+                    args.prepared, prepared, recording, args.start_n, args.max_n
+                )
+            else:
+                prepare_visual(
+                    recording,
+                    prepared,
+                    args.start_n,
+                    args.max_n,
+                    args.width,
+                    args.imu_offset_ms,
+                    args.time_source,
+                    args.extrinsics,
+                )
+        source = (
+            Path(args.colmap_source).expanduser().resolve()
+            if args.colmap_source
+            else None
+        )
+        if source is None:
+            frames = read_csv(prepared / "frames.csv")
+            source = out / "sfm"
+            for stage in ("extract", "match", "database", "reconstruct"):
+                command = [
+                    sys.executable,
+                    ROOT / "standalone/orbslam3/neon_sfm.py",
+                    "--prepared",
+                    prepared,
+                    "--output",
+                    source,
+                    "--start_n",
+                    int(frames[0]["frame_id"]),
+                    "--max_n",
+                    len(frames),
+                    "--stage",
+                    stage,
+                ]
+                if stage != "extract":
+                    command += ["--resume"]
+                run_logged(
+                    command,
+                    out / f"colmap_{stage}.log",
+                    progress=StageProgress(out, f"COLMAP {stage}", 1),
+                )
+            source = source / f"mapping_auto_{len(frames)}"
+        with StageProgress(out, "COLMAP軌跡変換", 1):
+            summary = convert_colmap(
+                prepared,
+                source,
+                out / "geometry",
+                policy=args.colmap_map_policy,
+                map_id=args.colmap_map_id,
+                scale=args.colmap_scale_m_per_unit,
+                align_gravity=args.colmap_align_gravity,
+            )
+        write_json(out / "pipeline.json", summary)
+        evaluate_segments(summary, out, args.reference)
+        if not args.vio_only:
+            run_inference(summary, out, args)
+        print(
+            f"Visual poses: {summary['visual_pose_frames']}/{summary['input_frames']}; metric poses: 0"
+        )
+        print(f"Summary: {out / 'pipeline.json'}")
+    except Exception as exc:
+        write_json(
+            out / "failure.json",
+            dict(
+                pose_backend="colmap",
+                status="failed",
+                error=str(exc),
+                outputs_preserved=True,
+            ),
+        )
+        raise
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--pose_backend",
+        "--pose-backend",
+        choices=["orbslam3", "colmap"],
+        default="orbslam3",
+    )
+    parser.add_argument("--colmap_source", "--colmap-source")
+    parser.add_argument(
+        "--colmap_map_policy",
+        "--colmap-map-policy",
+        choices=["largest", "separated"],
+        default="largest",
+    )
+    parser.add_argument("--colmap_map_id", "--colmap-map-id", type=int)
+    parser.add_argument(
+        "--colmap_scale_m_per_unit", "--colmap-scale-m-per-unit", type=float
+    )
+    parser.add_argument(
+        "--colmap_align_gravity",
+        action="store_true",
+        help="Apply candidate IMU tilt alignment; remains unverified preview",
+    )
+    parser.add_argument(
+        "--nonmetric_preview", "--nonmetric-preview", action="store_true"
+    )
     parser.add_argument("--input", required=True)
     parser.add_argument(
         "--output", required=True, help="New run directory, e.g. output/neon_run_01"
@@ -256,7 +387,9 @@ def main():
     parser.add_argument("--experimental-noise", action="store_true")
     parser.add_argument("--extrinsics")
     parser.add_argument(
-        "--min-frames", type=int, default=2,
+        "--min-frames",
+        type=int,
+        default=2,
         help="Minimum consecutive valid metric poses (default: 2; use 30 for the former length filter)",
     )
     parser.add_argument("--pace", type=float, default=1.0)
@@ -281,7 +414,7 @@ def main():
         help="Independent reference trajectory NPZ for accuracy evaluation",
     )
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--vio-only", action="store_true")
+    mode.add_argument("--vio-only", "--poses-only", action="store_true")
     mode.add_argument(
         "--boxer-only",
         action="store_true",
@@ -301,6 +434,9 @@ def main():
             summary = json.loads((out / "pipeline.json").read_text())
             if Path(summary["recording"]).resolve() != recording:
                 raise ValueError("Existing pipeline has no matching usable recording")
+            if summary.get("nonmetric_preview"):
+                if not args.nonmetric_preview or args.fuse or args.gaze_targets or args.point_cloud == "on":
+                    raise ValueError("Existing COLMAP preview requires --nonmetric_preview and forbids fusion/3D gaze/metric points")
             evaluate_segments(summary, out, args.reference)
             run_inference(summary, out, args)
             StageProgress(out, "選択した全工程", 1).finish(True)
@@ -310,6 +446,11 @@ def main():
             raise ValueError(f"Output is not empty; choose a new directory: {out}")
         if args.min_frames < 2:
             raise ValueError("--min-frames must be >= 2")
+        if args.start_n < 0 or args.max_n < 2:
+            raise ValueError("Require start_n >= 0 and max_n >= 2")
+        if args.pose_backend == "colmap":
+            run_colmap_pipeline(args, recording, out)
+            return
         binary = ROOT / "output/neon_vio_build/mono_inertial_neon"
         vocabulary = ROOT / "output/neon_vio_deps/ORB_SLAM3/Vocabulary/ORBvoc.txt"
         if not binary.is_file() or not vocabulary.is_file():
@@ -321,7 +462,9 @@ def main():
             else out / "prepared"
         )
         if args.prepared:
-            manifest = json.loads((prepared / "manifest.json").read_text())
+            from utils.neon_colmap_pipeline import select_prepared
+            manifest = select_prepared(prepared, out / "prepared_selection", recording, args.start_n, args.max_n)
+            prepared = out / "prepared_selection"
             if Path(manifest["recording"]).resolve() != recording:
                 raise ValueError("Prepared input belongs to a different recording")
             print(
@@ -371,6 +514,7 @@ def main():
             ]
         )
         summary = {
+            "pose_backend": "orbslam3",
             "recording": str(recording),
             "prepared": str(prepared),
             "input_frames": len(selected_frame_ids(prepared)),
